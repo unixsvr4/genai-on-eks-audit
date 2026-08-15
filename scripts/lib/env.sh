@@ -43,7 +43,12 @@ fi
 MASK_EXPR="s/\\Q${AWS_ACCOUNT_ID}\\E/${MASKED_ACCOUNT_ID}/g"
 # Guarded: an empty CALLER_NAME would turn into `s/\Q\E/foobar/g`, an
 # empty-pattern match that inserts "foobar" between every character.
-[ -n "$CALLER_NAME" ] && MASK_EXPR="${MASK_EXPR}; s/\\Q${CALLER_NAME}\\E/${MASKED_CALLER_NAME}/g"
+# `if`, not a bare `[ ] && ...`: under `set -e` a false bare `&&` statement
+# at top level kills the whole script (would silently break every script
+# that sources this file on an account where CALLER_NAME came back empty).
+if [ -n "$CALLER_NAME" ]; then
+  MASK_EXPR="${MASK_EXPR}; s/\\Q${CALLER_NAME}\\E/${MASKED_CALLER_NAME}/g"
+fi
 SCRIPT_OUT_DIR="$(cd "$(dirname "$0")/.." && pwd)/outputs"
 mkdir -p "$SCRIPT_OUT_DIR"
 SCRIPT_OUT_FILE="${SCRIPT_OUT_DIR}/$(basename "$0" .sh).out.txt"
