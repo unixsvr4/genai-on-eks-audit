@@ -1,0 +1,33 @@
+# Cloned Terraform + downloaded artifacts (fetched fresh at pinned tags, not vendored)
+.deploy/
+
+# Manifests are fetched at runtime by scripts/*.sh — see manifests/README.md
+manifests/*
+!manifests/README.md
+
+# Per-run terminal transcripts (scripts/lib/env.sh tees every script's output
+# here) — contain account IDs/ARNs/IPs from your own run; commit specific
+# ones deliberately (e.g. for a students' walkthrough) with `git add -f`
+# rather than by default.
+outputs/*
+!outputs/README.md
+
+# Terraform local state/cache, if terraform is ever run directly from this repo
+**/.terraform/
+**/.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+
+# Local secrets / env overrides
+.env
+*.local
+
+# OS cruft
+.DS_Store
+
+# Editor cruft
+.vscode/
+.idea/
+*.swp

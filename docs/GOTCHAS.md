@@ -1,0 +1,58 @@
+# Gotchas — everything that wasn't in the workshop instructions
+
+Every item here was hit **live**, verified against real command output, and is cited to the exact spot in [`RESEARCH.md`](../RESEARCH.md) where it happened. It is collected here in full because any write-up of a run like this can only carry a fraction of it.
+
+## EKS Auto Mode & cluster setup
+
+- **GPU nodes truly scale to zero.** `kubectl get nodepool/gpu` showed `NODES: 0` right up until the first pod requesting `nvidia.com/gpu` was scheduled — Auto Mode doesn't idle-park GPU capacity. First GPU node took ~30s–1min to go Ready from a cold NodePool.
+- **`checkip.amazonaws.com` must be queried from your local browser, not the workshop IDE terminal** — the IDE is itself an EC2 instance, so `curl`ing from inside it returns the *instance's* IP, not yours, and you'll lock yourself out of your own ALBs.
+- **`IngressClassParams.inboundCIDRs` overrides every individual Ingress's own `inbound-cidrs` annotation.** Several manifests in this workshop request `0.0.0.0/0` directly on the Ingress — that request is silently capped by the cluster-wide restriction set once, early on. Don't assume an Ingress annotation is the actual source of truth for who can reach it.
+- **The Grafana admin password is a hardcoded chart default** (`notforproductionuse`), not randomly generated. Fine for a 4-hour demo; would be a real finding in a security review of anything longer-lived.
+- **An unfiltered `aws ec2 describe-instances` silently excludes EKS Auto Mode's own worker nodes.** They carry `"Operator": {"Managed": true, "Principal": "eks.amazonaws.com", "HiddenByDefault": true}` in the API response, and AWS omits operator-managed resources from a blanket Describe call by default — confirmed live, same account/region/moment: `describe-instances --instance-ids <id>` found the node fine, the unfiltered call returned zero `Reservations`. Query by explicit instance ID (an EKS Auto Mode node's name **is** its EC2 instance ID, so `kubectl get nodes` gives you exactly what you need) rather than scanning the whole account. Cost this repo real debugging time in `scripts/real_cost_of_cluster.sh` — see that script's comments for the fix.
+
+## vLLM / model serving
+
+- **`served-model-name` isn't set by default** — without it, vLLM's `/v1/models` and every client request has to address the model by its raw S3 URI (`s3://bucket/Ministral-3-8B-Instruct-2512/`). Set it explicitly or your OpenAI-API clients get an ugly model identifier.
+- **DCGM shows ~40GB "used" on a 46GB GPU at 0% utilization** — this is not a leak. vLLM pre-allocates its entire KV-cache pool upfront at startup (the whole point of PagedAttention's memory-pool strategy), so the framebuffer looks "full" long before any request has been served.
+- **The saturation benchmark reveals a real, concrete scaling ceiling**, not a hand-wavy one: staged load at 5→10→20 req/s on a single L40S showed TTFT holding steady through 10 req/s (~70ms) then **doubling to 160ms at the 20 req/s stage**, with achieved throughput falling further short of the target rate at each step up. That's the actual moment to point to when explaining "why do we need to scale out" instead of guessing.
+
+## Observability (Prometheus / Grafana)
+
+- **`release: kube-prometheus-stack` is a hard requirement on every ServiceMonitor/PodMonitor**, confirmed three separate times (DCGM's Helm-generated one, a hand-written one for vLLM, and Ray's PodMonitors). Miss this label and the Prometheus Operator silently ignores the object — no error, just no data.
+- **Pre-provisioned Grafana dashboards can exist long before the thing they visualize does.** The Ray Grafana dashboards were present and "39h old" from the very start of the workshop, sitting empty until the Ray/KubeRay module — several modules later — finally gave them a data source. If you see dashboards for a component you haven't deployed yet, it's often just sequencing, not a bug.
+
+## LMCache / KV-cache tiering
+
+- **`pip install lmcache==0.3.8` fails on every run** (PyPI's version list jumps `0.3.7 → 0.3.9`) — but the container already has a working version pre-installed (`0.3.13` in this run), so this red error line in the logs is cosmetic. Don't chase it.
+- **`PYTHONHASHSEED` must be set explicitly in production** — LMCache's own logs warn that its default hash implementation isn't consistent across process restarts without it, which would silently break cache-key consistency in a real multi-replica deployment.
+- **ElastiCache Serverless Valkey needs its own dedicated `cleanup-valkey.sh`.** `kubectl delete pod` only removes the Kubernetes side; the actual AWS cache resource and its security group keep billing until you run the AWS-side teardown separately.
+- **`CreateServerlessCache` throwing `InvalidCredentialsException` on the first attempt is a known transient flake**, not a real credentials problem — the setup script is idempotent about the security group, so it's safe to just retry once.
+
+## Ray Serve / KubeRay
+
+- **The Ray/KubeRay manifests are pinned to noticeably older repo tags** than the plain-vLLM path in the same sample repo (`v2.3.x` vs `v2.4.x`–`v2.5.x`) — the two serving paths are clearly maintained somewhat independently even though they live in one repo.
+- **A RayService creates three Kubernetes Services with overlapping-but-different port sets** (`vllm`, `vllm-head-svc`, `vllm-serve-svc`) — know which one to actually point clients at. It's `vllm-serve-svc:8000`, deliberately the same Service name the plain-vLLM path used, so nothing downstream (Open WebUI, RAG service) needs to change when you swap serving frameworks underneath it.
+
+## RAG, fine-tuning, and the failures worth documenting honestly
+
+- **The single biggest gotcha of the whole workshop**: an S3-backed PersistentVolume (via the Mountpoint-for-S3 CSI driver) depends on **live IAM credentials for the entire lifetime of the mount**, unlike the Run:ai Model Streamer approach used everywhere else, which only needs credentials at model-load time. When the workshop's temporary AWS session started expiring mid-"Customize Model," this is exactly the resource that broke first — a pod stuck in `ContainerCreating` for 37+ minutes with no useful error.
+- **The tell that credentials are expiring is oddly indirect**: `aws s3 ls` on a bucket you already know the name of failed with `AccessDenied` on `s3:ListAllMyBuckets` — a permission that has nothing to do with listing objects in a known bucket. If you see that specific mismatch, suspect session/IAM expiry before anything else.
+- **A stuck pod produces a cascade of misleading downstream errors**: `port-forward` correctly refuses ("pod is not running"), and every subsequent `curl` to that port returns an empty body, which a JSON parser reports as `Expecting value: line 1 column 1` — easy to misread as an API bug when the real story is "nothing is listening."
+- **Services get reused by name across modules on purpose** — the RAG service's `MODEL_ENDPOINT` points at the same `vllm-serve-svc:8000` name used since "Serve a Model." If a previous module's model deployment never came up, the RAG service and its Gradio UI will still deploy cleanly and report `Running` — they just have no backend to actually answer a query. A clean `kubectl rollout status` does **not** mean the feature works end-to-end.
+- **Stray local `port-forward` processes accumulate over a long session.** A "port already in use" error, followed by a `curl` that returns a confusing 404, usually means you hit some *other* stale forwarded service on that port, not the one you intended — check `lsof -i :<port>` before reusing a port number.
+
+## AWS billing & account structure
+
+- **An On-Demand Capacity Reservation you create yourself bills at the on-demand rate for the reservation's active duration, whether or not a matching instance is actually running in it** — but you're not double-charged when one is. Total GPU cost is effectively `(hours the ODCR exists) × (hourly rate)`, which is why setting `--end-date-type limited` up front matters more than trying to optimize GPU utilization within the window. See [`COST.md`](./COST.md).
+- **In the AWS-hosted workshop event specifically, the GPU capacity reservation lived in a separate AWS-operator account** from the attendee's own ephemeral account (`cancel-capacity-reservation` failed with `UnauthorizedOperation` against an ARN in a different account ID) — a deliberate shared-pool design so no single attendee can release capacity out from under others. This doesn't apply when you own the ODCR yourself, as this repo's reproduction does.
+- **`terraform destroy` failing with "command not found" at the end of an AWS-hosted event is expected, not a bug** — the cleanup script is shared boilerplate between the self-paced and at-event instructions; at an event, the base cluster/VPC teardown is AWS's own responsibility when the event's stack is torn down, not something attendees run themselves.
+
+## Reproducing this repo in a fresh AWS account
+
+- **A brand-new AWS account can silently block every non-Free-Tier-eligible instance type**, which breaks `01-deploy-infra.sh` in a way the workshop itself never hit (the workshop ran in pre-warmed AWS-hosted accounts). Live symptom: `terraform apply` fails after the 20-minute EKS addon timeout with `aws_eks_addon.s3_csi_driver` stuck `DEGRADED` and `helm_release.kube_prometheus_stack`'s pre-install hook timing out — both because the `general-purpose` Karpenter NodePool never produces a working node. `kubectl`/Kubernetes-level diagnostics (NodeClaim status, events, `FailedScheduling` messages) never surface the real reason — they only show the symptom (no node exists). The actual cause only appears in a full CloudTrail `CreateFleet` event body: **every** instance-type override in the request fails with `errorCode: InvalidParameterCombination`, `errorMessage: "The specified instance type is not eligible for Free Tier..."`. The `system` NodePool's two nodes launched fine because they came up in the narrow window right at cluster creation, apparently before this restriction started being enforced on the account. Full diagnostic trail: `DIAGNOSTICS0.md` → `DIAGNOSTICS3.md` at the repo root.
+- **`kubectl describe nodeclaim` can't catch the failure in the act.** In this account's churn, a new `general-purpose-*` NodeClaim was created roughly every 90 seconds and torn down before ever reaching a terminal `Launched=False` condition — `describe` only ever caught the *next* one at `~49s` old, still `AwaitingReconciliation`. The real error lives one layer down, in the EC2 API response, not in anything Kubernetes-visible.
+- **The `errorCode`-substring CloudTrail filter is a trap.** Filtering `lookup-events` output for JSON containing the literal text `"errorCode"` matches essentially every event in the account, because CloudTrail includes that key (often `null`) on successful calls too. Read one full, unfiltered event body (`jq .` on the whole `CloudTrailEvent`) instead of trying to filter for errors client-side.
+
+## General workshop-repo hygiene
+
+- **The upstream sample repo is pinned to at least 7 different tags across one workshop's manifests** (`v2.3.1`, `v2.3.2`, `v2.4.7`, `v2.4.8`, `v2.5.0`, `v2.5.1`, `v2.5.2` all appear), sometimes even **within the same module** (dataset from one tag, job manifest from the next tag up). If you're reproducing this outside the live event, pin the *exact* tag each command used — don't assume `main`/latest is safe, and don't assume one tag covers the whole workshop.
