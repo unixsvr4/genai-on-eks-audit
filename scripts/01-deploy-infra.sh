@@ -23,6 +23,9 @@ aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION"
 log "Verifying cluster connection..."
 kubectl get pods --all-namespaces
 
+log "Nodes this created (the gpu NodePool won't show here -- it only launches a node once 02-gpu-infrastructure.sh schedules a pod onto it):"
+kubectl get nodes -o wide
+
 # Gotcha (docs/GOTCHAS.md "EKS Auto Mode & cluster setup"): checkip.amazonaws.com
 # MUST be queried from wherever YOU are actually running this script, not from
 # inside a remote build box / CI runner unless that's genuinely your access point -
