@@ -1240,6 +1240,56 @@ Both failures are expected in the **at-event** path: that directory only exists 
 
 ---
 
+## Identifier masking in `scripts/lib/env.sh` was silently broken (2026-09-02)
+
+Found while porting the `BEGIN{$|=1}` autoflush fix across all three clouds.
+`\Q` suppresses regex METAcharacters, not interpolation, so an identifier
+inlined into the perl program is still parsed as perl source:
+
+```
+$ echo "a.b@gmail.com" | perl -pe 's/\Qa.b@gmail.com\E/MASKED/g'
+a.b@gmail.com                      # unchanged -- never matched
+$ echo "a.b@gmail.com" | perl -wpe 's/\Qa.b@gmail.com\E/MASKED/g'
+Possible unintended interpolation of @gmail in string at -e line 1.
+```
+
+`@gmail` expands as an empty array, so the pattern silently becomes
+`a.b.com`, which never appears. Any clause masking a value containing `@`
+therefore matched nothing. It looked correct only because the scripts print
+the pre-masked shell variable (`${MASKED_ACCOUNT}`) themselves -- so the
+clause was never exercised on the output it exists to protect: raw
+identifiers appearing in terraform/kubectl/cloud-CLI output, which went
+through to the terminal and the `outputs/` transcript unmasked.
+
+Second problem in the same line: inlining put the raw values in perl's argv,
+readable by any user on the machine. Observed live during an `azure/` run:
+
+```
+$ ps -eo pid,etime,command
+29749  02:03  perl -pe s/\Q@@NEVERMATCH@@\E//; s/\Q<full-subscription-guid>\E/...;
+              s/\Q<full-tenant-guid>\E/...; s/\Q<real-email>\E/...
+```
+
+Fixed by moving values through `%ENV` and keeping the perl program
+single-quoted, so bash never substitutes into it and perl never parses an
+identifier as code. Measured with long-lived processes:
+
+| | raw value in perl argv | `a.b@gmail.com` masked | `svc+ci/admin` masked |
+|---|---|---|---|
+| inline (old) | **yes** | no | n/a |
+| `%ENV` (new) | no | yes | yes |
+
+The `%ENV` form also fixes metacharacter-bearing identifiers (`+ / .` are
+literalised correctly by `\Q` on a runtime value) and replaces the
+`@@NEVERMATCH@@` sentinel with a plain `length` guard.
+
+Verified against the real `env.sh` by sourcing it and echoing the live
+subscription id, tenant id and UPN as a tool would: all three came out
+masked, and the transcript held 399 bytes 1.2s into a run containing a
+2s stall (0 bytes would mean the buffering bug was still present).
+
+---
+
 ## 8. Summary
 
 Workshop's own closing framing: EKS's value for GenAI workloads is scalability/resiliency/repeatable-deployments plus more control/flexibility/cost-effectiveness than fully-managed options — positioned as complementary to, not a replacement for, **Amazon Bedrock** (off-the-shelf FM access) and **Amazon SageMaker** (train/deploy custom models), for when you specifically need self-hosted control over the serving stack.

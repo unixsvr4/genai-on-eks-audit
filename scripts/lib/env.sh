@@ -40,20 +40,50 @@ fi
 # only (terminal keeps color). Third-party tools (terraform/kubectl/helm/aws)
 # auto-disable their own color once stdout isn't a TTY, which is expected
 # pipe behavior, not something to work around.
-MASK_EXPR="s/\\Q${AWS_ACCOUNT_ID}\\E/${MASKED_ACCOUNT_ID}/g"
-# Guarded: an empty CALLER_NAME would turn into `s/\Q\E/foobar/g`, an
-# empty-pattern match that inserts "foobar" between every character.
-# `if`, not a bare `[ ] && ...`: under `set -e` a false bare `&&` statement
-# at top level kills the whole script (would silently break every script
-# that sources this file on an account where CALLER_NAME came back empty).
-if [ -n "$CALLER_NAME" ]; then
-  MASK_EXPR="${MASK_EXPR}; s/\\Q${CALLER_NAME}\\E/${MASKED_CALLER_NAME}/g"
-fi
+# The mask program is SINGLE-quoted, so bash never substitutes into it and
+# perl never parses an identifier as code. Values travel through the
+# environment instead, which fixes three things at once:
+#
+#   1. Interpolation. `\Q` suppresses regex METAcharacters, not
+#      interpolation, so an inlined `s/\Qa.b@gmail.com\E/.../g` has perl
+#      expand `@gmail` as an empty array and silently match `a.b.com`, which
+#      never appears. The email clause here had therefore never masked
+#      anything; it only looked correct because the scripts print the
+#      pre-masked shell variable themselves. Raw identifiers appearing in
+#      third-party output (terraform/kubectl/cloud CLI) went through
+#      unmasked, into the terminal and the outputs/ transcript both.
+#      Confirmed with `perl -wpe`: "Possible unintended interpolation of
+#      @gmail in string".
+#   2. Process-table exposure. Inlining put the raw account id and email in
+#      perl's argv, where any user on the box could read them out of `ps`.
+#      %ENV is not shown by a plain `ps -e`.
+#   3. Empty and metacharacter-bearing values. `length` guards the
+#      empty-pattern case that would otherwise insert the replacement
+#      between every character, and \Q on a runtime value correctly
+#      literalizes `+ / .` in names.
+#
+# BEGIN{$|=1} is the autoflush: perl block-buffers at 8KB whenever STDOUT is
+# not a TTY, and neither stage here has one -- the first writes into a pipe
+# to tee, the second into the transcript file. Without it a script that logs
+# a few lines then blocks on a slow cloud call prints NOTHING for the
+# duration and leaves the transcript at 0 bytes, indistinguishable from a
+# hang. Found in azure/ (RESEARCH.md entry 13a) where 00-prereqs.sh ran
+# 3m12s that way.
+MASK_PROG='BEGIN{$|=1}
+  for my $i (1..9) {
+    my $s = $ENV{"MASK_SRC_$i"};
+    next unless defined $s && length $s;
+    my $d = $ENV{"MASK_DST_$i"};
+    $d = "" unless defined $d;
+    s/\Q$s\E/$d/g;
+  }'
+export MASK_SRC_1="$AWS_ACCOUNT_ID" MASK_DST_1="$MASKED_ACCOUNT_ID"
+export MASK_SRC_2="$CALLER_NAME"    MASK_DST_2="$MASKED_CALLER_NAME"
 SCRIPT_OUT_DIR="$(cd "$(dirname "$0")/.." && pwd)/outputs"
 mkdir -p "$SCRIPT_OUT_DIR"
 SCRIPT_OUT_FILE="${SCRIPT_OUT_DIR}/$(basename "$0" .sh).out.txt"
-exec > >(perl -pe "$MASK_EXPR" \
-         | tee >(perl -pe 's/\e\[[0-9;]*m//g' > "$SCRIPT_OUT_FILE")) 2>&1
+exec > >(perl -pe "$MASK_PROG" \
+         | tee >(perl -pe 'BEGIN{$|=1} s/\e\[[0-9;]*m//g' > "$SCRIPT_OUT_FILE")) 2>&1
 
 export AWS_REGION="${AWS_REGION:-us-east-2}"                 # same region the workshop used
 export CLUSTER_NAME="${CLUSTER_NAME:-genai-workshop}"
