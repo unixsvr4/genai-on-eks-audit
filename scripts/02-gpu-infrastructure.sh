@@ -16,6 +16,59 @@ log "Checking GPU NodePool/NodeClass exist..."
 kubectl get nodepool/gpu
 kubectl get nodeclass/gpu
 
+# HARD GATE — must run BEFORE the ODCR is created.
+#
+# This script commits money at the create-capacity-reservation call below, but the
+# first evidence that a GPU node cannot launch does not arrive until the kubectl
+# wait ~50 lines later. On an account whose Free Tier plan forbids ${INSTANCE_TYPE},
+# that gap costs a full ${ODCR_HOURS}h reservation at the on-demand rate for capacity
+# no instance is permitted to occupy -- billed from creation, used never. That is
+# exactly what happened on 2026-09-03 (DIAGNOSTICS8.md), which is why this is a
+# `die` and not a warning: the whole point is to stop before the spend.
+#
+# Note this is NOT the quota check. Eligibility is evaluated before quota, so a
+# granted GPU quota says nothing about whether the launch will be permitted.
+log "Checking the account's Free Tier plan permits ${INSTANCE_TYPE} (before creating any billable reservation)..."
+set +e
+free_tier_check "$INSTANCE_TYPE"
+FT_RC=$?
+set -e
+case "$FT_RC" in
+  0)
+    if [ "$FT_PLAN_TYPE" = "FREE" ]; then
+      log "Account is on the FREE plan, but ${INSTANCE_TYPE} is Free-Tier-eligible — proceeding."
+    else
+      log "Account plan is ${FT_PLAN_TYPE} — no Free Tier instance-type restriction."
+    fi
+    ;;
+  1)
+    warn "Account plan is FREE. It may launch ONLY these instance types in ${AWS_REGION}:"
+    warn "  $(echo "$FT_ELIGIBLE_TYPES" | tr '\n' ' ')"
+    warn "${INSTANCE_TYPE} is not among them, so Karpenter's gpu NodePool will churn NodeClaims"
+    warn "forever with FreeTierIneligible and no GPU node will EVER launch. Your GPU service"
+    warn "quota is irrelevant here — eligibility is checked before quota."
+    warn ""
+    warn "Refusing to continue: the next step creates a ${ODCR_HOURS}h capacity reservation that"
+    warn "bills the full ${INSTANCE_TYPE} on-demand rate from the moment it exists, for capacity"
+    warn "no instance could occupy. See DIAGNOSTICS8.md."
+    warn ""
+    warn "Fix (a plan change — this does NOT clear by waiting):"
+    warn "  aws freetier upgrade-account-plan --account-plan-type PAID"
+    warn "  (or: AWS Billing console -> Free Tier -> 'Upgrade to a paid plan')"
+    warn ""
+    warn "To override anyway — you will be billed for the reservation regardless:"
+    warn "  ALLOW_FREE_TIER_BLOCKED=1 ./02-gpu-infrastructure.sh"
+    [ "${ALLOW_FREE_TIER_BLOCKED:-0}" = "1" ] \
+      || die "${INSTANCE_TYPE} cannot launch on this account's FREE plan. Nothing was created, nothing was billed."
+    warn "ALLOW_FREE_TIER_BLOCKED=1 set — continuing into a launch that is expected to fail."
+    ;;
+  *)
+    warn "Could not determine the account's Free Tier plan (needs aws-cli >= 2.22 and freetier:GetAccountPlanState). Continuing, but if the GPU node never appears, check this first:"
+    warn "  aws freetier get-account-plan-state"
+    warn "  aws ec2 describe-instance-types --region ${AWS_REGION} --filters \"Name=free-tier-eligible,Values=true\" --query 'InstanceTypes[].InstanceType' --output text"
+    ;;
+esac
+
 EXISTING_ODCR=$(aws ec2 describe-capacity-reservations --region "$AWS_REGION" \
   --filters "Name=state,Values=active" "Name=instance-type,Values=${INSTANCE_TYPE}" \
   --query "CapacityReservations[0].CapacityReservationId" --output text 2>/dev/null || echo "None")

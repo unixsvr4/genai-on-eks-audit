@@ -58,42 +58,44 @@ log "Authenticated as: ${MASKED_ARN} (account ${MASKED_ACCOUNT})"
 # ask which types that plan permits, and compare. Zero cost, no cluster, no launch
 # template, and it runs correctly before anything has been deployed.
 PLAN_BLOCKS_GPU=0
+# Shared with 02-gpu-infrastructure.sh via free_tier_check() in lib/env.sh, so the
+# advisory check here and the hard gate there can never disagree.
 log "Checking the account's Free Tier plan (this gates which instance types can launch at all)..."
-PLAN_TYPE=$(aws freetier get-account-plan-state --query 'accountPlanType' --output text 2>/dev/null || echo "")
-
-if [ -z "$PLAN_TYPE" ] || [ "$PLAN_TYPE" = "None" ]; then
-  # Old CLI without the `freetier` service, missing freetier:GetAccountPlanState,
-  # or a legacy account the API does not describe. Don't guess -- say so.
-  warn "Could not read the account plan (needs aws-cli >= 2.22 and freetier:GetAccountPlanState). Skipping the Free Tier gate — if 01/02 later churn NodeClaims with 'FreeTierIneligible', this is why. Check manually:"
-  warn "  aws freetier get-account-plan-state"
-elif [ "$PLAN_TYPE" = "FREE" ]; then
-  FT_ELIGIBLE=$(aws ec2 describe-instance-types --region "$AWS_REGION" \
-    --filters "Name=free-tier-eligible,Values=true" \
-    --query 'InstanceTypes[].InstanceType' --output text 2>/dev/null | tr '\t' '\n' | sort || echo "")
-  warn "This account is on the FREE plan (accountPlanType=FREE). It can ONLY launch Free-Tier-eligible instance types:"
-  warn "  $(echo "$FT_ELIGIBLE" | tr '\n' ' ')"
-  if echo "$FT_ELIGIBLE" | grep -qx "$INSTANCE_TYPE"; then
-    log "${INSTANCE_TYPE} IS Free-Tier-eligible — the GPU node can launch on this plan."
-  else
-    warn "${INSTANCE_TYPE} is NOT in that set, so 02-gpu-infrastructure.sh CANNOT launch a GPU node on this account, no matter what the GPU quota says."
-    warn "This does NOT clear by waiting — it is the account's plan, not a temporary validation hold. Upgrade to a paid plan first:"
-    warn "  AWS Billing console -> Free Tier -> 'Upgrade to a paid plan'  (or: aws freetier upgrade-account-plan --account-plan-type PAID)"
-    warn "Until then, DO NOT run 02-gpu-infrastructure.sh: it creates a ${ODCR_HOURS}h On-Demand Capacity Reservation that bills the full ${INSTANCE_TYPE} rate from the moment it is created, for capacity no node will ever be able to occupy."
+set +e
+free_tier_check "$INSTANCE_TYPE"
+FT_RC=$?
+set -e
+case "$FT_RC" in
+  0)
+    if [ "$FT_PLAN_TYPE" = "FREE" ]; then
+      log "Account is on the FREE plan, but ${INSTANCE_TYPE} is Free-Tier-eligible — the GPU node can launch."
+    else
+      log "Account plan is ${FT_PLAN_TYPE} — no Free Tier instance-type restriction."
+    fi
+    ;;
+  1)
+    warn "This account is on the FREE plan. It can ONLY launch these instance types in ${AWS_REGION}:"
+    warn "  $(echo "$FT_ELIGIBLE_TYPES" | tr '\n' ' ')"
+    warn "${INSTANCE_TYPE} is NOT among them, so 02-gpu-infrastructure.sh CANNOT launch a GPU node on this account, no matter what the GPU quota says."
+    warn "This does NOT clear by waiting — it is the account's plan, not a temporary validation hold. Upgrade first:"
+    warn "  aws freetier upgrade-account-plan --account-plan-type PAID"
+    warn "  (or: AWS Billing console -> Free Tier -> 'Upgrade to a paid plan')"
+    warn "Until then, DO NOT run 02-gpu-infrastructure.sh: it creates a ${ODCR_HOURS}h On-Demand Capacity Reservation that bills the full ${INSTANCE_TYPE} rate from the moment it is created, for capacity no node will ever be able to occupy. (That script now refuses on its own too.)"
     PLAN_BLOCKS_GPU=1
-  fi
-  # 01-deploy-infra.sh is survivable on a FREE plan only because Karpenter's system /
-  # general-purpose pools accept a wide instance-type range and can fall back to an
-  # eligible one (c7i-flex.large, on the reference account). The gpu NodePool is
-  # pinned to exactly one type, so it has no fallback. This is the whole reason
-  # DIAGNOSTICS0-7 read as "intermittent, seems to be clearing".
-  if ! echo "$FT_ELIGIBLE" | grep -qE '^(c7i-flex|m7i-flex)\.large$'; then
-    warn "No flex-class type is Free-Tier-eligible in ${AWS_REGION} either — 01-deploy-infra.sh's system/general-purpose NodePools may not find a launchable type here at all."
-  fi
-elif [ "$PLAN_TYPE" = "PAID" ]; then
-  log "Account is on the PAID plan — no Free Tier instance-type restriction."
-else
-  log "Account plan reported as '${PLAN_TYPE}' (not FREE/PAID) — treating as unrestricted, but see DIAGNOSTICS8.md if launches fail."
-fi
+    # 01-deploy-infra.sh survives a FREE plan only because Karpenter's system and
+    # general-purpose pools accept a wide instance-type range and can fall back to an
+    # eligible one (c7i-flex.large, on the reference account). The gpu NodePool is
+    # pinned to exactly one type, so it has no fallback — that asymmetry is why
+    # DIAGNOSTICS0-7 read the failure as "intermittent, seems to be clearing".
+    if ! echo "$FT_ELIGIBLE_TYPES" | grep -qE '^(c7i-flex|m7i-flex)\.large$'; then
+      warn "No flex-class type is Free-Tier-eligible in ${AWS_REGION} either — 01-deploy-infra.sh's system/general-purpose NodePools may not find a launchable type here at all."
+    fi
+    ;;
+  *)
+    warn "Could not read the account plan (needs aws-cli >= 2.22 and freetier:GetAccountPlanState). Skipping the Free Tier gate — if 01/02 later churn NodeClaims with 'FreeTierIneligible', this is why. Check manually:"
+    warn "  aws freetier get-account-plan-state"
+    ;;
+esac
 
 log "Checking GPU instance quota for ${INSTANCE_TYPE} in ${AWS_REGION}..."
 # g6e instances fall under the "Running On-Demand G and VT instances" vCPU-based quota (L-DB2E81BA).

@@ -209,7 +209,58 @@ aws ec2 cancel-capacity-reservation --region us-east-2 --capacity-reservation-id
 ```
 
 **The lesson worth keeping**: `02-gpu-infrastructure.sh` commits money *before*
-it discovers whether a GPU node can launch — the ODCR is created at line 30,
-the first evidence of failure arrives at line 81. On any account that has not
-already launched this instance type successfully, verify eligibility before
-running it. That check is now in `00-prereqs.sh`.
+it discovers whether a GPU node can launch — the ODCR was created at line 30,
+the first evidence of failure arrived at line 81. Closing that window is worth
+more than any amount of documentation, so the check now exists in two places:
+
+- `00-prereqs.sh` — advisory, tells you before you start.
+- `02-gpu-infrastructure.sh` — a **hard gate** that `die`s before the
+  `create-capacity-reservation` call. `00-prereqs.sh` can be skipped or
+  scrolled past; this one cannot. Escape hatch for anyone who wants to prove
+  it to themselves: `ALLOW_FREE_TIER_BLOCKED=1 ./02-gpu-infrastructure.sh`
+  (you will be billed for the reservation regardless).
+
+Both call one `free_tier_check()` in `scripts/lib/env.sh`, so the advisory and
+the gate cannot drift apart. It returns 0 launchable / 1 blocked /
+2 indeterminate, and treats an empty `describe-instance-types` result as
+indeterminate rather than as a block — an API hiccup should not hard-fail a
+deploy. Both paths verified against the live FREE-plan account:
+
+```
+g6e.2xlarge     -> plan=FREE rc=1  BLOCK   -> FATAL, nothing created, nothing billed
+c7i-flex.large  -> plan=FREE rc=0  ALLOW
+```
+
+## Teardown footnote — `terraform destroy` timing out on the monitoring namespace
+
+The teardown that followed this round failed with:
+
+```
+kubernetes_namespace_v1.monitoring: Still destroying... [id=monitoring, 04m50s elapsed]
+│ Error: context deadline exceeded
+```
+
+**This is a false alarm, and the destroy is resumable.** The namespace had
+already been deleted successfully — `kubectl get ns monitoring` returned
+`NotFound` immediately afterwards. The Kubernetes provider simply hit its own
+5-minute wait timeout before the API reported completion.
+
+It is slow for a structural reason worth noting: Terraform tore down
+`module.vpc.aws_nat_gateway`, the public subnets and the internet gateway
+*concurrently* with the namespace deletion, because `kubernetes_namespace_v1`
+carries no dependency edge to the VPC. Removing the cluster's egress path
+while it is finalizing namespaced resources is not a combination that finishes
+quickly.
+
+Recovery is just to re-run it — `terraform destroy` picks up where it stopped,
+and on the next pass the namespace is already gone:
+
+```bash
+./99-destroy-all.sh
+```
+
+State after the failed run, for reference: NAT gateway, EIP, public subnets,
+internet gateway, S3 bucket, AMP workspace and all IAM roles destroyed; no EC2
+instances, no ALBs, no EIPs remaining; the EKS cluster still `ACTIVE` (control
+plane still billing) with 54 resources left in state. The expensive line items
+were already gone — only the control plane was still costing anything.

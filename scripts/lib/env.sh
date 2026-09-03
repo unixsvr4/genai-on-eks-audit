@@ -112,3 +112,36 @@ export S3_RAG_DATA_BUCKET="rag-workshop-data-${AWS_ACCOUNT_ID}-${AWS_REGION}"
 log()  { printf '\033[1;36m[%s]\033[0m %s\n' "$(date +%H:%M:%S)" "$*"; }
 warn() { printf '\033[1;33m[%s] WARNING:\033[0m %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 die()  { printf '\033[1;31m[%s] FATAL:\033[0m %s\n' "$(date +%H:%M:%S)" "$*" >&2; exit 1; }
+
+# --- Free Tier plan eligibility (shared by 00-prereqs.sh and 02-gpu-infrastructure.sh) ---
+# An account on the new Free Tier plan (accountPlanType=FREE) may launch ONLY the
+# free-tier-eligible instance types. This is a plan property: it does not expire, it
+# is evaluated BEFORE service quotas, and no dry-run can detect it -- run-instances
+# --dry-run, create-fleet --dry-run and Karpenter's own internal dry-run were all
+# measured returning success against a provably-blocked g6e.2xlarge. See
+# DIAGNOSTICS8.md. So ask the account what plan it is on and what that plan permits.
+#
+# Sets FT_PLAN_TYPE and FT_ELIGIBLE_TYPES, then returns:
+#   0  the given instance type is launchable (or the plan does not restrict it)
+#   1  the plan is FREE and the type is NOT launchable
+#   2  indeterminate (old CLI, missing freetier:GetAccountPlanState, unknown plan)
+free_tier_check() {
+  local want="$1"
+  FT_PLAN_TYPE="$(aws freetier get-account-plan-state --query 'accountPlanType' --output text 2>/dev/null || echo "")"
+  FT_ELIGIBLE_TYPES=""
+  case "$FT_PLAN_TYPE" in
+    FREE)
+      FT_ELIGIBLE_TYPES="$(aws ec2 describe-instance-types --region "$AWS_REGION" \
+        --filters "Name=free-tier-eligible,Values=true" \
+        --query 'InstanceTypes[].InstanceType' --output text 2>/dev/null | tr '\t' '\n' | sort)"
+      # An empty list means the describe call failed, not that nothing is eligible --
+      # don't turn an API hiccup into a hard block.
+      [ -z "$FT_ELIGIBLE_TYPES" ] && return 2
+      echo "$FT_ELIGIBLE_TYPES" | grep -qx "$want" && return 0
+      return 1
+      ;;
+    PAID)    return 0 ;;
+    ""|None) return 2 ;;
+    *)       return 2 ;;
+  esac
+}
