@@ -6,11 +6,17 @@ manifests/*
 !manifests/README.md
 
 # Per-run terminal transcripts (scripts/lib/env.sh tees every script's output
-# here) — contain account IDs/ARNs/IPs from your own run; commit specific
-# ones deliberately (e.g. for a students' walkthrough) with `git add -f`
-# rather than by default.
-outputs/*
-!outputs/README.md
+# here, one timestamped file per run) — LOCAL ONLY. They carry account IDs,
+# ARNs and your home IP, so nothing in them is ever pushed.
+#
+# `**/outputs/*` matches an outputs/ dir at ANY depth — the old anchored
+# `outputs/*` only caught the top-level one, leaving scripts/outputs/
+# untracked-but-committable. Note this ignores the CONTENTS, not the directory
+# itself: git will not descend into a directory it has ignored outright, so
+# `outputs/` would make the README negation below dead.
+# To share one deliberately (e.g. a students' walkthrough): git add -f <file>
+**/outputs/*
+!**/outputs/README.md
 
 # Terraform local state/cache, if terraform is ever run directly from this repo
 **/.terraform/

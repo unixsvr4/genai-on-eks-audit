@@ -81,7 +81,26 @@ export MASK_SRC_1="$AWS_ACCOUNT_ID" MASK_DST_1="$MASKED_ACCOUNT_ID"
 export MASK_SRC_2="$CALLER_NAME"    MASK_DST_2="$MASKED_CALLER_NAME"
 SCRIPT_OUT_DIR="$(cd "$(dirname "$0")/.." && pwd)/outputs"
 mkdir -p "$SCRIPT_OUT_DIR"
-SCRIPT_OUT_FILE="${SCRIPT_OUT_DIR}/$(basename "$0" .sh).out.txt"
+# Transcripts are per-RUN, not per-script. The old fixed `<script>.out.txt` meant
+# every re-run silently overwrote the previous one — which destroyed exactly the
+# evidence you most want to keep, since the case where you re-run a script is the
+# case where the first attempt went wrong. (Lost this way: the successful
+# 99-destroy-all run whose ordering we wanted to inspect, clobbered ~10 minutes
+# later by a second no-op run of the same script.)
+#
+# `<script>-<YYYYmmdd-HHMMSS>.out.txt` keeps every run; `<script>-latest.out.txt`
+# is a relative symlink to the newest, so `cat outputs/01-deploy-infra-latest.out.txt`
+# still just works. The whole directory is gitignored — these are local-only and
+# carry account IDs/ARNs/IPs.
+SCRIPT_STEM="$(basename "$0" .sh)"
+SCRIPT_OUT_FILE="${SCRIPT_OUT_DIR}/${SCRIPT_STEM}-$(date +%Y%m%d-%H%M%S).out.txt"
+# Two runs starting in the same second would otherwise share a file.
+_n=2
+while [ -e "$SCRIPT_OUT_FILE" ]; do
+  SCRIPT_OUT_FILE="${SCRIPT_OUT_DIR}/${SCRIPT_STEM}-$(date +%Y%m%d-%H%M%S)_${_n}.out.txt"
+  _n=$((_n + 1))
+done
+ln -sfn "$(basename "$SCRIPT_OUT_FILE")" "${SCRIPT_OUT_DIR}/${SCRIPT_STEM}-latest.out.txt"
 exec > >(perl -pe "$MASK_PROG" \
          | tee >(perl -pe 'BEGIN{$|=1} s/\e\[[0-9;]*m//g' > "$SCRIPT_OUT_FILE")) 2>&1
 
