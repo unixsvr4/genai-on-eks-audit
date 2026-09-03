@@ -28,42 +28,71 @@ MASKED_ACCOUNT="********${ACCOUNT_ID: -4}"
 MASKED_ARN="${ARN/$ACCOUNT_ID/$MASKED_ACCOUNT}"
 log "Authenticated as: ${MASKED_ARN} (account ${MASKED_ACCOUNT})"
 
-# --- Free Tier / new-account launch restriction -----------------------------
-# Real gotcha hit on the first live run of this repo (see docs/GOTCHAS.md
-# "Reproducing this repo in a fresh AWS account" and DIAGNOSTICS0.md-DIAGNOSTICS4.md
-# for the full multi-hour trace): a brand-new or rarely-used AWS account can have
-# an ACCOUNT-WIDE restriction that blocks launching ANY non-Free-Tier-eligible
-# instance type. This has nothing to do with any service quota — quota checks
-# below can look perfectly fine while this restriction still blocks every launch.
-# It broke 01-deploy-infra.sh in a way that's invisible at the Kubernetes/Terraform
-# layer: Karpenter's `general-purpose` NodePool (needed for the S3 CSI driver
-# controller and the kube-prometheus-stack Helm hooks) churns forever without
-# ever producing a node, and the real error only shows up in a raw CloudTrail
-# CreateFleet event body as `errorCode: InvalidParameterCombination`,
-# `errorMessage: "The specified instance type is not eligible for Free Tier..."`.
+# --- Free Tier plan launch restriction ---------------------------------------
+# THE single most expensive gotcha in this repo. See DIAGNOSTICS0.md-DIAGNOSTICS8.md.
 #
-# Detect it early with an EC2 dry-run using a representative non-free-tier type
-# (c5.large — one of the types Karpenter's general-purpose pool actually tries).
-# `--dry-run` validates the request (including this restriction) without
-# launching anything or costing a cent; a clean account gets `DryRunOperation`
-# ("would have succeeded"), a restricted one gets the Free Tier error immediately.
-log "Checking for an account-wide Free Tier launch restriction..."
-AMI_ID=$(aws ssm get-parameter --region "$AWS_REGION" \
-  --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
-  --query 'Parameter.Value' --output text 2>/dev/null || echo "")
-if [ -n "$AMI_ID" ]; then
-  DRYRUN_OUT=$(aws ec2 run-instances --region "$AWS_REGION" --dry-run \
-    --instance-type c5.large --image-id "$AMI_ID" --count 1 2>&1 || true)
-  if echo "$DRYRUN_OUT" | grep -qi "not eligible for Free Tier"; then
-    warn "Your AWS account currently blocks launching non-Free-Tier-eligible instances (a c5.large dry-run failed with 'not eligible for Free Tier'). This WILL break 01-deploy-infra.sh — Karpenter's general-purpose NodePool needs exactly this kind of instance to run the S3 CSI driver controller and kube-prometheus-stack's install hooks."
-    warn "This is a temporary AWS account validation hold, NOT a bug in this repo — see docs/GOTCHAS.md and DIAGNOSTICS0.md-DIAGNOSTICS4.md for the full live trace. AWS typically sends an automatic 'your request has been validated' email once it clears (minutes to ~a day observed). There is nothing to fix on your end but waiting — re-run this script periodically until this check passes."
-  elif echo "$DRYRUN_OUT" | grep -qi "DryRunOperation"; then
-    log "No Free Tier launch restriction detected (dry-run succeeded)."
+# An AWS account on the *new* Free Tier plan (accountPlanType == FREE, the default
+# for accounts created since the 2025 Free Tier redesign) may only launch instance
+# types that are Free-Tier-eligible -- currently a set of six. Every other type is
+# refused. This is a property of the account PLAN, not a transient hold, so it does
+# NOT clear by waiting, and it is completely independent of service quotas: you can
+# hold a granted 16-vCPU GPU quota and still be unable to launch a single g6e.
+#
+# It is invisible at the Kubernetes/Terraform layer. Karpenter's NodeClaims churn
+# forever with `FreeTierIneligible`, and the underlying error only appears in a raw
+# CloudTrail CreateFleet event body -- CreateFleet returns HTTP 200 and buries the
+# rejection in `errorSet.item`:
+#     errorCode:    InvalidParameterCombination
+#     errorMessage: "The specified instance type is not eligible for Free Tier."
+#
+# DO NOT "detect" this with a dry-run. Three dry-run signals were measured against a
+# genuinely blocked g6e.2xlarge (DIAGNOSTICS8.md) and ALL THREE reported success:
+#   1. `aws ec2 run-instances --dry-run`  -> DryRunOperation   (what this script used
+#      to do; it never evaluates Free Tier eligibility at all)
+#   2. `aws ec2 create-fleet  --dry-run`  -> DryRunOperation   (returned success even
+#      with a launch-template id that did not exist -- it validates almost nothing)
+#   3. Karpenter's own internal CreateFleet dry-run -> Client.DryRunOperation
+# Only a REAL CreateFleet surfaces it, and a real CreateFleet launches an instance.
+#
+# So this gate is authoritative instead of empirical: ask what plan the account is on,
+# ask which types that plan permits, and compare. Zero cost, no cluster, no launch
+# template, and it runs correctly before anything has been deployed.
+PLAN_BLOCKS_GPU=0
+log "Checking the account's Free Tier plan (this gates which instance types can launch at all)..."
+PLAN_TYPE=$(aws freetier get-account-plan-state --query 'accountPlanType' --output text 2>/dev/null || echo "")
+
+if [ -z "$PLAN_TYPE" ] || [ "$PLAN_TYPE" = "None" ]; then
+  # Old CLI without the `freetier` service, missing freetier:GetAccountPlanState,
+  # or a legacy account the API does not describe. Don't guess -- say so.
+  warn "Could not read the account plan (needs aws-cli >= 2.22 and freetier:GetAccountPlanState). Skipping the Free Tier gate — if 01/02 later churn NodeClaims with 'FreeTierIneligible', this is why. Check manually:"
+  warn "  aws freetier get-account-plan-state"
+elif [ "$PLAN_TYPE" = "FREE" ]; then
+  FT_ELIGIBLE=$(aws ec2 describe-instance-types --region "$AWS_REGION" \
+    --filters "Name=free-tier-eligible,Values=true" \
+    --query 'InstanceTypes[].InstanceType' --output text 2>/dev/null | tr '\t' '\n' | sort || echo "")
+  warn "This account is on the FREE plan (accountPlanType=FREE). It can ONLY launch Free-Tier-eligible instance types:"
+  warn "  $(echo "$FT_ELIGIBLE" | tr '\n' ' ')"
+  if echo "$FT_ELIGIBLE" | grep -qx "$INSTANCE_TYPE"; then
+    log "${INSTANCE_TYPE} IS Free-Tier-eligible — the GPU node can launch on this plan."
   else
-    log "Free Tier restriction dry-run check was inconclusive (often just means no default VPC exists yet, which is fine) — skipping."
+    warn "${INSTANCE_TYPE} is NOT in that set, so 02-gpu-infrastructure.sh CANNOT launch a GPU node on this account, no matter what the GPU quota says."
+    warn "This does NOT clear by waiting — it is the account's plan, not a temporary validation hold. Upgrade to a paid plan first:"
+    warn "  AWS Billing console -> Free Tier -> 'Upgrade to a paid plan'  (or: aws freetier upgrade-account-plan --account-plan-type PAID)"
+    warn "Until then, DO NOT run 02-gpu-infrastructure.sh: it creates a ${ODCR_HOURS}h On-Demand Capacity Reservation that bills the full ${INSTANCE_TYPE} rate from the moment it is created, for capacity no node will ever be able to occupy."
+    PLAN_BLOCKS_GPU=1
   fi
+  # 01-deploy-infra.sh is survivable on a FREE plan only because Karpenter's system /
+  # general-purpose pools accept a wide instance-type range and can fall back to an
+  # eligible one (c7i-flex.large, on the reference account). The gpu NodePool is
+  # pinned to exactly one type, so it has no fallback. This is the whole reason
+  # DIAGNOSTICS0-7 read as "intermittent, seems to be clearing".
+  if ! echo "$FT_ELIGIBLE" | grep -qE '^(c7i-flex|m7i-flex)\.large$'; then
+    warn "No flex-class type is Free-Tier-eligible in ${AWS_REGION} either — 01-deploy-infra.sh's system/general-purpose NodePools may not find a launchable type here at all."
+  fi
+elif [ "$PLAN_TYPE" = "PAID" ]; then
+  log "Account is on the PAID plan — no Free Tier instance-type restriction."
 else
-  log "Could not resolve a test AMI via SSM — skipping Free Tier restriction check."
+  log "Account plan reported as '${PLAN_TYPE}' (not FREE/PAID) — treating as unrestricted, but see DIAGNOSTICS8.md if launches fail."
 fi
 
 log "Checking GPU instance quota for ${INSTANCE_TYPE} in ${AWS_REGION}..."
@@ -90,6 +119,15 @@ EXISTING_ODCR=$(aws ec2 describe-capacity-reservations --region "$AWS_REGION" \
   --query "CapacityReservations[0].CapacityReservationId" --output text 2>/dev/null || echo "None")
 if [ "$EXISTING_ODCR" != "None" ] && [ -n "$EXISTING_ODCR" ]; then
   warn "Found an existing active ODCR for ${INSTANCE_TYPE}: ${EXISTING_ODCR}. 01-deploy-infra.sh will reuse it rather than creating a second one — verify this is one you expect."
+fi
+
+if [ "$PLAN_BLOCKS_GPU" -eq 1 ]; then
+  warn "----------------------------------------------------------------------"
+  warn "SUMMARY: 01-deploy-infra.sh can run, but 02-gpu-infrastructure.sh cannot"
+  warn "succeed on this account's FREE plan — ${INSTANCE_TYPE} is not launchable."
+  warn "Upgrade to a paid plan before running 02, or you will pay for an unusable"
+  warn "capacity reservation. See DIAGNOSTICS8.md."
+  warn "----------------------------------------------------------------------"
 fi
 
 log "Prereqs check complete. Read docs/COST.md before running 01-deploy-infra.sh — this is not a free-tier-eligible repo."
