@@ -27,7 +27,7 @@ Ministral-3-8B-Instruct-2512 served on vLLM via **EKS Auto Mode**, on the same `
 | [`docs/COST.md`](./docs/COST.md) | Line-item cost estimate (~$12–20 for a full 4-hour run) + how ODCR billing actually works, since it's not intuitive. **Read before running anything — this is not free-tier eligible.** |
 | [`docs/GOTCHAS.md`](./docs/GOTCHAS.md) | Every non-obvious failure mode hit live, with citations. |
 | [`docs/FIRST_RUN.md`](./docs/FIRST_RUN.md) | Real timing + a live gotcha from actually running `01-deploy-infra.sh` against a fresh account — a quota check `00-prereqs.sh` misses. |
-| [`DIAGNOSTICS0.md`](./DIAGNOSTICS0.md) → [`DIAGNOSTICS4.md`](./DIAGNOSTICS4.md) | The full blow-by-blow live debugging trail behind the fresh-account gotcha below — five rounds from first symptom to root cause to confirmed fix. `00-prereqs.sh` now checks for this automatically, but read these if you want the whole story or hit something it doesn't catch. |
+| [`DIAGNOSTICS0.md`](./DIAGNOSTICS0.md) → [`DIAGNOSTICS7.md`](./DIAGNOSTICS7.md) | The full blow-by-blow live debugging trail behind the fresh-account gotcha below — eight rounds from first symptom to root cause to confirmed fix, ending with both account blockers cleared. `00-prereqs.sh` and `01-deploy-infra.sh` now check for these automatically, but read these if you want the whole story or hit something they don't catch. |
 | [`PUBLICATION.md`](./PUBLICATION.md) | What was swept from this repo before it was made public, and the two process mistakes that sweep caught. |
 
 ## New or Free Tier AWS account? Read this before you start the clock
@@ -43,6 +43,13 @@ Most people cloning this will be on a new or lightly-used AWS account, and this 
 2. **A separate, undocumented-by-AWS restriction can block launching *any* non-Free-Tier-eligible instance type at all** — not just GPU instances. This one is nastier because it's invisible at the Kubernetes/Terraform layer: `01-deploy-infra.sh` times out after 20 minutes with the S3 CSI driver addon stuck `DEGRADED` and the `kube-prometheus-stack` Helm install hanging, because Karpenter's `general-purpose` NodePool (plain `c5`/`m5`-class instances, nothing GPU-related) churns forever without ever producing a node. The real cause only shows up in a raw CloudTrail `CreateFleet` event body: `errorCode: InvalidParameterCombination`, `"not eligible for Free Tier"`. `00-prereqs.sh` now runs an EC2 dry-run to detect this *before* you start the 20-minute wait. If it fires, there's nothing to fix on your end — it clears via an automatic AWS account-validation process (AWS emails you when it does; took under two hours on the account that hit this). Just wait and re-run `00-prereqs.sh` periodically.
 
    The full real-time debugging trail — including how genuinely hard this was to pin down (four rounds of diagnostics, three ruled-out wrong hypotheses, before a raw CloudTrail event body revealed the real error) — is in [`DIAGNOSTICS0.md`](./DIAGNOSTICS0.md) through [`DIAGNOSTICS4.md`](./DIAGNOSTICS4.md), plus the summarized version in [`docs/GOTCHAS.md`](./docs/GOTCHAS.md#reproducing-this-repo-in-a-fresh-aws-account).
+
+3. **An interrupted `terraform apply` leaves a Helm release Terraform can't see.** If either blocker above (or anything else) kills an apply partway, Helm may already hold a `kube-prometheus-stack` release record that never made it into Terraform state. The next apply then fails with `Error: installation failed ... cannot re-use a name that is still in use`, which looks like a Terraform bug and isn't. This bit the repo three times; as of `DIAGNOSTICS7.md`, `01-deploy-infra.sh` detects the orphan (failed/pending release **and** absent from `terraform state list`) and clears it automatically. A release Terraform *does* track is deliberately left alone. Manual equivalent:
+   ```bash
+   helm uninstall kube-prometheus-stack -n monitoring
+   ```
+
+**Both account-level blockers above cleared on the reference account on 2026-09-03** — `L-DB2E81BA` granted at 16 vCPUs (two `g6e.2xlarge`), and `c5.large`/`g6e.2xlarge` dry-runs both returning `DryRunOperation`. See [`DIAGNOSTICS7.md`](./DIAGNOSTICS7.md) for the verification commands, and note that the Helm symptom recurred there *without* the Free Tier hold — same surface error, different cause.
 
 ## Quickstart
 
