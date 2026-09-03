@@ -22,4 +22,16 @@ log "Cloning aws-samples/sample-genai-on-eks @ ${TERRAFORM_TAG} into ${TARGET}..
 git clone --depth 1 --branch "$TERRAFORM_TAG" \
   https://github.com/aws-samples/sample-genai-on-eks.git "$TARGET"
 
+# --- Destroy-ordering fix ----------------------------------------------------
+# Upstream has no dependency edge from the Kubernetes layer to module.vpc, so
+# `terraform destroy` races the NAT gateway / subnets / IGW against the
+# monitoring namespace and dies with "context deadline exceeded". A
+# *_override.tf cannot fix this -- Terraform rejects it ("The depends_on
+# argument may not be overridden") -- so the vendored files are edited in place,
+# here, on every clone. The patcher asserts each upstream depends_on before
+# touching it and is idempotent. See scripts/lib/fix_destroy_order.py.
+log "Applying the destroy-ordering fix to the clone..."
+python3 "${REPO_ROOT}/scripts/lib/fix_destroy_order.py" "${TARGET}/terraform" \
+  || die "Could not apply the destroy-ordering fix -- upstream @ ${TERRAFORM_TAG} no longer matches what scripts/lib/fix_destroy_order.py expects (see above). Reconcile it before deploying, or `terraform destroy` will hit the ordering bug in DIAGNOSTICS8.md."
+
 log "Cloned. Terraform module lives at: ${TARGET}/terraform"

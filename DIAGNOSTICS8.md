@@ -259,6 +259,68 @@ and on the next pass the namespace is already gone:
 ./99-destroy-all.sh
 ```
 
+### Fixed properly, not just documented
+
+Re-running works, but "it fails the first time, run it again" is not an
+acceptable teardown story, so the ordering itself is now corrected.
+
+Terraform's dependency graph is **per-resource, not per-module**. Upstream,
+every cluster-facing resource roots at `module.eks`, and `module.eks` depends
+only on `module.vpc`'s *private subnets*. The NAT gateway, EIP, internet
+gateway and public subnets have no dependents at all, so Terraform treats them
+as leaves and destroys them immediately — in parallel with a Kubernetes layer
+still making API calls through them.
+
+The fix adds `module.vpc` to the `depends_on` of the **root of each
+cluster-facing chain**. Five roots cover all 31 cluster-facing resources
+transitively:
+
+| Root | Covers |
+|---|---|
+| `kubernetes_namespace_v1.monitoring` | both `helm_release`s, all 16 monitoring `kubectl_manifest`s, both service accounts, the `patch_dashboards_*` set |
+| `kubectl_manifest.mistral_model_pv` | `mistral_model_pvc` |
+| `kubectl_manifest.model_storage_service_account` | `job_model_download` |
+| `kubectl_manifest.ingress_class_params` | `ingress_class` |
+| `kubectl_manifest.eks_node_class_gpu` | `karpenter_node_pool_gpu` |
+
+Direction matters: it **must** be k8s-resource → `module.vpc`. The reverse is a
+cycle, since `module.eks` already depends on `module.vpc` and every one of
+these depends on `module.eks`.
+
+**An override file cannot do this.** The obvious approach — dropping a
+`*_override.tf` into the clone — was tried first and Terraform rejects it
+outright:
+
+```
+Error: Invalid depends_on resource
+  on destroy-order_override.tf line 88, in resource "kubectl_manifest" "eks_node_class_gpu":
+  The depends_on argument may not be overridden.
+```
+
+So `scripts/lib/fix_destroy_order.py` edits the vendored files in place, and
+`00-clone-terraform.sh` runs it on every clone. It asserts each resource's
+current upstream `depends_on` before touching it and `die`s if the pinned tag
+has moved and a list changed, rather than silently patching something it no
+longer understands. It is idempotent.
+
+**Verification.** `terraform graph` shows no direct namespace → NAT-gateway
+edge, because Terraform transitively reduces the graph — the path runs
+`namespace → aws_route.private_nat_gateway → aws_nat_gateway.this`. So the
+check that matters is reachability, computed on the real graph before and
+after the patch:
+
+```
+root                                              BEFORE   AFTER
+kubernetes_namespace_v1.monitoring                    NO     yes
+kubectl_manifest.mistral_model_pv                     NO     yes
+kubectl_manifest.model_storage_service_account        NO     yes
+kubectl_manifest.ingress_class_params                 NO     yes
+kubectl_manifest.eks_node_class_gpu                   NO     yes
+       (ordered before all four racing VPC resources?)
+```
+
+`terraform validate` passes, confirming no cycle was introduced.
+
 State after the failed run, for reference: NAT gateway, EIP, public subnets,
 internet gateway, S3 bucket, AMP workspace and all IAM roles destroyed; no EC2
 instances, no ALBs, no EIPs remaining; the EKS cluster still `ACTIVE` (control
