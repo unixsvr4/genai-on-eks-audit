@@ -692,3 +692,47 @@ The 04 case is the one worth remembering, because it did not fail. It printed a
 confident, wrong answer for the entire life of the repo, and only a read-through
 found it. `2>/dev/null || echo "<plausible default>"` is how a broken command
 becomes indistinguishable from a working one.
+
+
+---
+
+## Postscript 4 — `command -v docker` is not "Docker works"
+
+`05-agentic-app.sh` is the only script in the workshop that builds an image, and
+it failed immediately after a line saying the opposite:
+
+```console
+[11:47:42] Building + pushing to ECR...
+Login Succeeded
+ERROR: failed to connect to the docker API at unix:///var/run/docker.sock;
+check if the path is correct and if the daemon is running:
+dial unix /var/run/docker.sock: connect: no such file or directory
+```
+
+`docker login` against ECR **succeeds with no daemon running** — it only writes a
+credential into the local docker config and never contacts the daemon. So the run
+produced a confident `Login Succeeded` and then died one line later, in a way
+that reads as an ECR or IAM problem. It is neither: OrbStack was installed and
+simply not started.
+
+`00-prereqs.sh` did not catch it, because its tooling check was:
+
+```bash
+for tool in aws kubectl helm terraform docker jq envsubst curl; do
+  command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+done
+```
+
+`command -v docker` proves the CLI is on PATH. That is the same substitution as
+everything else in this round — presence standing in for readiness.
+
+### Fix
+
+- `00-prereqs.sh` now runs `docker info` and **warns** (does not `die`): 05 is the
+  only script that needs the daemon, and 00-04 and 06-11 run fine without it, so
+  refusing the whole workshop over it would be wrong. The warning repeats in the
+  end-of-run summary.
+- `05-agentic-app.sh` `die`s on `docker info` **before** the ECR login, so the
+  misleading `Login Succeeded` never gets printed and the error names the actual
+  cause. Verified both ways with a stubbed `docker`: daemon down exits 1 with the
+  start-it message, daemon up proceeds to the build.

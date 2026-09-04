@@ -19,6 +19,25 @@ if [ "${#missing[@]}" -gt 0 ]; then
 fi
 log "All required tools present: aws kubectl helm terraform docker jq envsubst curl"
 
+# `command -v docker` proves only that the CLI is installed. 05-agentic-app.sh
+# needs the DAEMON, and the two fail very differently: `docker login` against ECR
+# succeeds with no daemon at all (it only writes a credential into the local
+# docker config), so the run gets a reassuring "Login Succeeded" and then dies on
+# the next line:
+#     ERROR: failed to connect to the docker API at unix:///var/run/docker.sock;
+#     check if the path is correct and if the daemon is running
+# Checking it here costs one local call and moves the failure to the script whose
+# job is to find problems. Not fatal -- 05 is the only script that needs it, and
+# everything else in the workshop runs fine without it.
+if docker info >/dev/null 2>&1; then
+  log "Docker daemon is reachable."
+else
+  warn "Docker CLI is installed but the DAEMON is not reachable ('docker info' failed)."
+  warn "Only 05-agentic-app.sh needs it (it builds and pushes the Strands agent image); 00-04 and 06-11 do not."
+  warn "Start it before running 05 -- e.g. 'open -a OrbStack' or 'open -a Docker', then re-check with 'docker info'."
+  DOCKER_DAEMON_DOWN=1
+fi
+
 log "Checking AWS identity..."
 # Masked rather than printed raw (account ID + ARN would otherwise land in
 # the .out.txt transcript scripts/lib/env.sh writes for every run — see
@@ -159,6 +178,10 @@ if [ "$PLAN_BLOCKS_GPU" -eq 1 ]; then
   warn "launch. 02-gpu-infrastructure.sh will still refuse on its own. Upgrade to"
   warn "a paid plan first. See DIAGNOSTICS8.md."
   warn "----------------------------------------------------------------------"
+fi
+
+if [ "${DOCKER_DAEMON_DOWN:-0}" -eq 1 ]; then
+  warn "REMINDER: the Docker daemon is down. 05-agentic-app.sh will fail at the image build (after a misleading 'Login Succeeded')."
 fi
 
 log "Prereqs check complete. Read docs/COST.md before running 01-deploy-infra.sh — this is not a free-tier-eligible repo."

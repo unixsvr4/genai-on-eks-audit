@@ -21,6 +21,12 @@ curl -sf -o "${MANIFEST_DIR}/600-strands-agent/strands.zip" \
   "https://ws-assets-prod-iad-r-pdx-f3b3f9f1a7d6a3d0.s3.us-west-2.amazonaws.com/029d6c4e-4775-41c9-85ff-9f5360f32a15/strands.zip"
 unzip -o "${MANIFEST_DIR}/600-strands-agent/strands.zip" -d "${MANIFEST_DIR}/600-strands-agent"
 
+# Check the daemon BEFORE the ECR login. `docker login` succeeds without a daemon
+# (it just writes a credential), so without this the run prints "Login Succeeded"
+# and then dies on the build -- which reads as an ECR/auth problem and is not one.
+docker info >/dev/null 2>&1 \
+  || die "The Docker daemon is not reachable ('docker info' failed), and this script has to build an image. Start it first -- e.g. 'open -a OrbStack' or 'open -a Docker' -- then re-run. Nothing has been created."
+
 log "Building + pushing to ECR..."
 aws ecr describe-repositories --repository-names strands-weather-agent >/dev/null 2>&1 \
   || aws ecr create-repository --repository-name strands-weather-agent >/dev/null
