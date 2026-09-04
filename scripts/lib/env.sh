@@ -239,3 +239,49 @@ pf_start() {
   done
   return 1
 }
+
+# Verify the Docker daemon is actually reachable -- and if it is not, work out
+# WHY, rather than asserting a cause.
+#
+# "docker info failed" has two very different causes and they need different
+# advice: the daemon is not running, or the daemon is running fine and the docker
+# context / DOCKER_HOST points at a socket that does not exist. Observed live
+# 2026-09-04: OrbStack was running and serving Docker 29.4.0 on
+# <home>/.orbstack/run/docker.sock, while the active context was `default` ->
+# unix:///var/run/docker.sock, which did not exist. Telling that user to "start
+# Docker" would have been useless -- it was already started.
+#
+# Sets DOCKER_ALT_SOCK to a working socket the current config is NOT using.
+# Returns 0 = reachable, 1 = daemon found at another socket, 2 = none found.
+docker_daemon_check() {
+  DOCKER_ALT_SOCK=""
+  docker info >/dev/null 2>&1 && return 0
+  local s
+  for s in "${HOME}/.orbstack/run/docker.sock" \
+           "${HOME}/.colima/default/docker.sock" \
+           "${HOME}/.docker/run/docker.sock" \
+           "${HOME}/.rd/docker.sock"; do
+    [ -S "$s" ] || continue
+    if DOCKER_HOST="unix://${s}" docker info >/dev/null 2>&1; then
+      DOCKER_ALT_SOCK="$s"
+      return 1
+    fi
+  done
+  return 2
+}
+
+# The human-readable half of the above, so 00 and 05 cannot describe the same
+# state differently. Echoes multi-line advice for the non-zero cases.
+docker_daemon_advice() {
+  if [ -n "${DOCKER_ALT_SOCK:-}" ]; then
+    echo "A Docker daemon IS running, but your docker context/DOCKER_HOST is not pointing at it."
+    echo "  working socket: ${DOCKER_ALT_SOCK}"
+    echo "  fix (persists across shells):"
+    echo "    docker context create orbstack --docker host=unix://${DOCKER_ALT_SOCK}"
+    echo "    docker context use orbstack"
+    echo "  or, for this shell only:  export DOCKER_HOST=unix://${DOCKER_ALT_SOCK}"
+  else
+    echo "No Docker daemon found at the configured endpoint or at any known socket."
+    echo "  start one -- e.g. 'open -a OrbStack' or 'open -a Docker' -- then re-check with 'docker info'."
+  fi
+}

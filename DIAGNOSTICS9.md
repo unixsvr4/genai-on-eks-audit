@@ -736,3 +736,54 @@ everything else in this round — presence standing in for readiness.
   misleading `Login Succeeded` never gets printed and the error names the actual
   cause. Verified both ways with a stubbed `docker`: daemon down exits 1 with the
   start-it message, daemon up proceeds to the build.
+
+### ...and then that fix told the user something false
+
+The message above says *"Start it -- e.g. `open -a OrbStack`"*. The user ran it,
+and Docker still did not work:
+
+```console
+$ open -a OrbStack
+$ docker ps
+failed to connect to the docker API at unix:///var/run/docker.sock; check if the
+path is correct and if the daemon is running
+```
+
+OrbStack was already running, and had been. Two processes up, and its daemon
+answering normally on its own socket:
+
+```console
+$ DOCKER_HOST="unix://<home>/.orbstack/run/docker.sock" docker info --format '{{.ServerVersion}} / {{.OperatingSystem}}'
+29.4.0 / OrbStack
+```
+
+The active docker context was `default` pointing at `unix:///var/run/docker.sock`,
+which did not exist, and no `orbstack` context was registered. So `docker info`
+failing had nothing to do with the daemon being down — it was a client pointed at
+the wrong socket.
+
+Which makes the new check **the same defect as everything else in this round**: it
+observed a symptom (`docker info` failed) and asserted a cause (*it is not
+running*) instead of checking. Writing "start the daemon" to someone whose daemon
+is already started is not a smaller version of that mistake; it is the mistake.
+
+**Fix**: `docker_daemon_check()` in `scripts/lib/env.sh` distinguishes the two.
+When `docker info` fails it probes the known per-runtime sockets (OrbStack,
+Colima, Docker Desktop, Rancher Desktop) and reports which of the two situations
+it is actually in:
+
+| return | meaning | advice given |
+|---|---|---|
+| 0 | reachable | none |
+| 1 | a daemon IS running, at a socket the current config is not using | the exact `docker context create` / `use` pair, with the discovered socket path |
+| 2 | nothing found anywhere | start one |
+
+`docker_daemon_advice()` renders the message, so 00 and 05 cannot describe the
+same state in two different ways. All three branches verified: the misconfigured
+case emits the working socket path and the exact two commands, and the genuinely
+absent case (probed with `HOME=/tmp`) falls through to "start one".
+
+The underlying situation resolved itself — OrbStack finished initialising and
+created `/var/run/docker.sock` a few minutes later, which is its own lesson: the
+first symptom was a startup race, and the confident diagnosis of it was wrong in
+both directions at once.

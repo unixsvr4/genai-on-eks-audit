@@ -29,12 +29,16 @@ log "All required tools present: aws kubectl helm terraform docker jq envsubst c
 # Checking it here costs one local call and moves the failure to the script whose
 # job is to find problems. Not fatal -- 05 is the only script that needs it, and
 # everything else in the workshop runs fine without it.
-if docker info >/dev/null 2>&1; then
+set +e
+docker_daemon_check
+DOCKER_RC=$?
+set -e
+if [ "$DOCKER_RC" -eq 0 ]; then
   log "Docker daemon is reachable."
 else
-  warn "Docker CLI is installed but the DAEMON is not reachable ('docker info' failed)."
-  warn "Only 05-agentic-app.sh needs it (it builds and pushes the Strands agent image); 00-04 and 06-11 do not."
-  warn "Start it before running 05 -- e.g. 'open -a OrbStack' or 'open -a Docker', then re-check with 'docker info'."
+  warn "Docker CLI is installed but 'docker info' failed."
+  warn "Only 05-agentic-app.sh needs the daemon (it builds and pushes the Strands agent image); 00-04 and 06-11 do not."
+  while IFS= read -r line; do warn "$line"; done <<< "$(docker_daemon_advice)"
   DOCKER_DAEMON_DOWN=1
 fi
 

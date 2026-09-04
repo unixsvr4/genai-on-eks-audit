@@ -24,8 +24,15 @@ unzip -o "${MANIFEST_DIR}/600-strands-agent/strands.zip" -d "${MANIFEST_DIR}/600
 # Check the daemon BEFORE the ECR login. `docker login` succeeds without a daemon
 # (it just writes a credential), so without this the run prints "Login Succeeded"
 # and then dies on the build -- which reads as an ECR/auth problem and is not one.
-docker info >/dev/null 2>&1 \
-  || die "The Docker daemon is not reachable ('docker info' failed), and this script has to build an image. Start it first -- e.g. 'open -a OrbStack' or 'open -a Docker' -- then re-run. Nothing has been created."
+set +e
+docker_daemon_check
+DOCKER_RC=$?
+set -e
+if [ "$DOCKER_RC" -ne 0 ]; then
+  warn "This script has to build an image, and 'docker info' failed."
+  while IFS= read -r line; do warn "$line"; done <<< "$(docker_daemon_advice)"
+  die "Docker is not usable. Nothing has been created."
+fi
 
 log "Building + pushing to ECR..."
 aws ecr describe-repositories --repository-names strands-weather-agent >/dev/null 2>&1 \
