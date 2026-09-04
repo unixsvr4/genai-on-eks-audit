@@ -376,3 +376,99 @@ by hand instead:
 The patchers' first live test is the next clone-and-apply cycle. This is the same
 status as the destroy-order fix from `DIAGNOSTICS8.md`, which also remains proven
 at the graph level and unexercised against a real destroy.
+
+---
+
+## Postscript — `02-gpu-infrastructure.sh` asked one AZ and called it a region
+
+Same session, different script, unrelated to the Job above. With the plan now
+`PAID`, the Free Tier hard gate passed on its first real test:
+
+```console
+[11:19:48] Checking the account's Free Tier plan permits g6e.2xlarge (before creating any billable reservation)...
+[11:19:49] Account plan is PAID — no Free Tier instance-type restriction.
+[11:19:50] Creating ODCR for 1x g6e.2xlarge, auto-expiring at 2026-09-04T19:19:50Z (4h from now)...
+
+aws: [ERROR]: An error occurred (InsufficientInstanceCapacity) when calling the
+CreateCapacityReservation operation (reached max retries: 2): Insufficient capacity.
+```
+
+Nothing was created and nothing was billed — but the script died, and the error
+reads as "the region has no GPUs".
+
+### Root cause
+
+An ODCR is **AZ-scoped**, and the script hardcoded one zone:
+
+```bash
+--availability-zone "${AWS_REGION}a"
+```
+
+`InsufficientInstanceCapacity` from that call means *`us-east-2a` is out of
+`g6e.2xlarge` right now*. It says nothing about the region. Measured at the time
+of failure:
+
+```console
+$ aws ec2 describe-instance-type-offerings --location-type availability-zone \
+    --filters "Name=instance-type,Values=g6e.2xlarge" --query 'InstanceTypeOfferings[].Location'
+us-east-2a   us-east-2b   us-east-2c
+
+$ aws ec2 describe-subnets --subnet-ids <the cluster's three private subnets> \
+    --query 'Subnets[].[SubnetId,AvailabilityZone]'
+subnet-<a>  us-east-2a
+subnet-<b>  us-east-2b
+subnet-<c>  us-east-2c
+```
+
+Two other AZs offer the type and have a cluster subnet to launch into. Neither
+was tried. The `(reached max retries: 2)` in the message is the AWS CLI retrying
+the *same* zone twice more, which is the one retry that cannot help.
+
+The GPU NodePool is also less restrictive than the script assumed:
+
+```console
+$ kubectl get nodepool gpu -o json | jq '.spec.template.spec.requirements'
+kubernetes.io/arch            In ['amd64']
+kubernetes.io/os              In ['linux']
+karpenter.sh/capacity-type    In ['reserved', 'on-demand']
+node.kubernetes.io/instance-type In ['g6e.2xlarge']
+```
+
+No AZ requirement, and `on-demand` is accepted alongside `reserved` — so the
+reservation is a capacity *guarantee*, not a prerequisite. The script was
+strictly more brittle than the cluster it configures.
+
+### Fix
+
+Try every AZ that can actually run the node: the AZs of the cluster's own subnets
+(`eks describe-cluster` → `ec2 describe-subnets`) intersected with the AZs that
+offer the instance type (`ec2 describe-instance-type-offerings`). Reserving in an
+AZ with no cluster subnet would strand the reservation, and reserving in an AZ
+that does not offer the type cannot succeed, so the intersection is the exact
+candidate set. Both lookups are free.
+
+Only a capacity shortage advances to the next AZ. Anything else — auth, quota,
+bad parameters — fails identically everywhere, so the loop `die`s on the first
+one instead of burning two more attempts to reach the same conclusion.
+
+If **every** AZ is short, the script no longer dies. It warns loudly and
+continues without a reservation, because that is a degraded mode rather than a
+failure: the NodePool accepts `on-demand`, so the node can still launch whenever
+capacity frees up. Continuing also costs *less*, not more — with no reservation
+nothing bills until an instance exists, whereas an ODCR bills from creation
+whether or not it is ever used (`docs/COST.md`). The NodeClass's
+`capacityReservationSelectorTerms` is cleared in that path, or Karpenter would
+keep waiting on a reservation that does not exist instead of falling back.
+
+### Verification
+
+The AZ discovery was run against the live cluster (read-only) and correctly
+derived `us-east-2a us-east-2b us-east-2c`. The retry loop was then exercised
+with `create-capacity-reservation` stubbed, so nothing was created:
+
+| capacity available in | outcome |
+|---|---|
+| all three AZs | reserves in `us-east-2a`, no warnings |
+| `us-east-2c` only | warns on `2a` and `2b`, reserves in `2c` |
+| none | warns per AZ, continues with no ODCR, exit 0 |
+| n/a — `UnauthorizedOperation` | `die`s on the first AZ, does not retry |

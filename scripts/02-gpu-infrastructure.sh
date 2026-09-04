@@ -79,23 +79,97 @@ if [ "$EXISTING_ODCR" != "None" ] && [ -n "$EXISTING_ODCR" ]; then
 else
   END_DATE=$(date -u -v+"${ODCR_HOURS}"H +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null \
     || date -u -d "+${ODCR_HOURS} hours" +"%Y-%m-%dT%H:%M:%SZ")
+
+  # An ODCR is AZ-scoped, and GPU capacity runs out per-AZ. This used to ask for
+  # ${AWS_REGION}a only and die on the first InsufficientInstanceCapacity, which
+  # is a shortage in ONE zone reported as if the region were empty:
+  #   An error occurred (InsufficientInstanceCapacity) when calling the
+  #   CreateCapacityReservation operation: Insufficient capacity.
+  # So try every AZ that can actually run the node. Candidates are the AZs of the
+  # cluster's own subnets (reserving where no subnet exists would strand the
+  # reservation) intersected with the AZs that offer ${INSTANCE_TYPE} at all.
+  CLUSTER_SUBNETS=$(aws eks describe-cluster --name "$CLUSTER_NAME" --region "$AWS_REGION" \
+    --query 'cluster.resourcesVpcConfig.subnetIds' --output text 2>/dev/null || echo "")
+  CLUSTER_AZS=""
+  if [ -n "$CLUSTER_SUBNETS" ]; then
+    # shellcheck disable=SC2086
+    CLUSTER_AZS=$(aws ec2 describe-subnets --region "$AWS_REGION" --subnet-ids $CLUSTER_SUBNETS \
+      --query 'Subnets[].AvailabilityZone' --output text 2>/dev/null | tr '\t' '\n' | sort -u)
+  fi
+  OFFERED_AZS=$(aws ec2 describe-instance-type-offerings --region "$AWS_REGION" \
+    --location-type availability-zone \
+    --filters "Name=instance-type,Values=${INSTANCE_TYPE}" \
+    --query 'InstanceTypeOfferings[].Location' --output text 2>/dev/null | tr '\t' '\n' | sort -u)
+
+  if [ -n "$CLUSTER_AZS" ] && [ -n "$OFFERED_AZS" ]; then
+    CANDIDATE_AZS=$(comm -12 <(echo "$CLUSTER_AZS") <(echo "$OFFERED_AZS"))
+  else
+    # Fall back to whichever list we managed to read, then to the old hardcoded AZ.
+    CANDIDATE_AZS="${OFFERED_AZS:-${CLUSTER_AZS:-${AWS_REGION}a}}"
+  fi
+  [ -z "$CANDIDATE_AZS" ] && die "No AZ in ${AWS_REGION} both offers ${INSTANCE_TYPE} and has a cluster subnet. Check the cluster's VPC layout."
+
   log "Creating ODCR for 1x ${INSTANCE_TYPE}, auto-expiring at ${END_DATE} (${ODCR_HOURS}h from now)..."
-  ODCR_ID=$(aws ec2 create-capacity-reservation \
-    --region "$AWS_REGION" \
-    --instance-type "$INSTANCE_TYPE" \
-    --instance-platform Linux/UNIX \
-    --availability-zone "${AWS_REGION}a" \
-    --instance-count 1 \
-    --instance-match-criteria open \
-    --end-date-type limited \
-    --end-date "$END_DATE" \
-    --query 'CapacityReservation.CapacityReservationId' --output text)
-  log "Created ODCR: ${ODCR_ID} (self-expires in ${ODCR_HOURS}h — see docs/COST.md before extending this)"
+  log "  AZs to try: $(echo "$CANDIDATE_AZS" | tr '\n' ' ')"
+  ODCR_ID=""
+  ODCR_AZ=""
+  for az in $CANDIDATE_AZS; do
+    set +e
+    ODCR_ERR=$(aws ec2 create-capacity-reservation \
+      --region "$AWS_REGION" \
+      --instance-type "$INSTANCE_TYPE" \
+      --instance-platform Linux/UNIX \
+      --availability-zone "$az" \
+      --instance-count 1 \
+      --instance-match-criteria open \
+      --end-date-type limited \
+      --end-date "$END_DATE" \
+      --query 'CapacityReservation.CapacityReservationId' --output text 2>&1)
+    RC=$?
+    set -e
+    if [ "$RC" -eq 0 ]; then
+      ODCR_ID="$ODCR_ERR"
+      ODCR_AZ="$az"
+      break
+    fi
+    case "$ODCR_ERR" in
+      *InsufficientInstanceCapacity*|*InsufficientCapacity*)
+        warn "  ${az}: no ${INSTANCE_TYPE} capacity right now — trying the next AZ."
+        ;;
+      *)
+        # Anything that is not a capacity shortage (auth, quota, bad params) will
+        # fail identically in every other AZ, so stop rather than retry 2 more times.
+        die "create-capacity-reservation failed in ${az} for a reason other than capacity. Nothing was created, nothing was billed:
+${ODCR_ERR}"
+        ;;
+    esac
+  done
+
+  if [ -n "$ODCR_ID" ]; then
+    log "Created ODCR: ${ODCR_ID} in ${ODCR_AZ} (self-expires in ${ODCR_HOURS}h — see docs/COST.md before extending this)"
+  else
+    # Every AZ is out of capacity. That is a real regional shortage, but it is NOT
+    # fatal: the gpu NodePool accepts capacity-type "on-demand" as well as
+    # "reserved", so Karpenter can still launch the node the moment capacity frees
+    # up anywhere in the region. Continuing also costs LESS, not more -- with no
+    # reservation nothing bills until an instance actually exists, whereas an ODCR
+    # bills from creation whether or not it is used (docs/COST.md).
+    warn "----------------------------------------------------------------------"
+    warn "No ${INSTANCE_TYPE} capacity in ANY candidate AZ: $(echo "$CANDIDATE_AZS" | tr '\n' ' ')"
+    warn "Continuing WITHOUT a capacity reservation. This is a degraded mode, not"
+    warn "a failure: the gpu NodePool allows capacity-type 'on-demand', so the node"
+    warn "can still launch -- but nothing is holding capacity for it, so it may sit"
+    warn "unschedulable until AWS has a ${INSTANCE_TYPE} free, and it can lose the"
+    warn "race to another customer. Nothing has been billed."
+    warn "Re-run this script later to pick up a reservation once capacity returns."
+    warn "----------------------------------------------------------------------"
+  fi
 fi
 
-log "Patching GPU NodeClass to use ODCR ${ODCR_ID}..."
 mkdir -p "${MANIFEST_DIR}/100-introduction"
-cat <<EOF > "${MANIFEST_DIR}/100-introduction/patch-gpu-nodeclass.yaml"
+if [ -n "$ODCR_ID" ]; then
+  log "Patching GPU NodeClass to use ODCR ${ODCR_ID}..."
+  cat <<EOF > "${MANIFEST_DIR}/100-introduction/patch-gpu-nodeclass.yaml"
 apiVersion: eks.amazonaws.com/v1
 kind: NodeClass
 metadata:
@@ -104,8 +178,14 @@ spec:
   capacityReservationSelectorTerms:
     - id: ${ODCR_ID}
 EOF
-kubectl patch nodeclass gpu --patch-file "${MANIFEST_DIR}/100-introduction/patch-gpu-nodeclass.yaml" --type=merge
-kubectl get nodeclass gpu -o yaml | grep -A 3 capacityReservationSelectorTerms
+  kubectl patch nodeclass gpu --patch-file "${MANIFEST_DIR}/100-introduction/patch-gpu-nodeclass.yaml" --type=merge
+  kubectl get nodeclass gpu -o yaml | grep -A 3 capacityReservationSelectorTerms
+else
+  # Clear any selector left by an earlier run, or Karpenter keeps waiting for a
+  # reservation that no longer exists instead of falling back to on-demand.
+  log "Clearing any capacityReservationSelectorTerms from the GPU NodeClass (running on-demand)..."
+  kubectl patch nodeclass gpu --type=merge -p '{"spec":{"capacityReservationSelectorTerms":null}}'
+fi
 
 log "Deploying nvidia-smi test pod to prove GPU provisioning + device plugin work..."
 cat << EOF | kubectl apply -f -
