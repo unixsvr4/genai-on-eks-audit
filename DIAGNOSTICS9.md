@@ -1239,3 +1239,35 @@ deleted by `99-destroy-all.sh`, so the teardown surface does not grow.
 Validated: the Job passes server-side dry-run against the live API server, and
 `aws s3vectors get-index` exists (a `die` on a nonexistent subcommand would have
 made the script unconditionally fail).
+
+### Confirmed on the re-run
+
+Every element of the fix is exercised in this transcript:
+
+```console
+[12:46:38]   using eletronics.jsonl
+upload: .../300-rag/eletronics.jsonl to s3://<data-bucket>/samples/electronics.jsonl
+  "indexArn": "arn:aws:s3vectors:us-east-2:<acct>:bucket/<vec-bucket>/index/knowledge-base"
+serviceaccount/s3-access-sa created
+[12:46:46] Waiting for the pod identity association to become visible ...
+[12:47:01] job.batch/rag-document-processor created
+Found 1 documents in S3 ... Processed 25 records ... Uploaded 25 vectors to S3 Vectors
+ S3 Vectors storage verification successful!
+[12:49:20] Verifying vectors landed in S3 Vectors...
+"HomeAudio 7.1"  "PhotoMaster DSLR"  "GameBox X"
+[12:50:10] RAG Gradio UI: http://rag-gradio-alb-<id>.us-east-2.elb.amazonaws.com/?__theme=dark
+```
+
+The dataset resolver picked the misspelled upstream name; the index was created
+with the right shape; the ingestion Job obtained credentials (it read S3 and wrote
+vectors, which is only possible through the role that did not exist an hour
+earlier); and the same `query-vectors` call that previously raised
+`NotFoundException` returned three real product names.
+
+The ALB hostname also printed correctly rather than `http://pending` — the
+`lb_hostname` fix from Postscript 3, confirmed serving:
+
+```console
+$ curl -o /dev/null -w "HTTP %{http_code}" http://rag-gradio-alb-<id>.us-east-2.elb.amazonaws.com/
+HTTP 200
+```
