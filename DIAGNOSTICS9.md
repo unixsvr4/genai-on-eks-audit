@@ -515,3 +515,82 @@ This is the empirical justification for the degraded path. Had the script kept
 its original behaviour — die on the first `InsufficientInstanceCapacity` — the
 workshop would have been blocked by a reservation it never actually needed, on a
 region that had the GPU available the whole time.
+
+---
+
+## Postscript 2 — `03-serve-model.sh` tested a server that had not started yet
+
+```console
+[11:34:29] node/i-<redacted> condition met
+           pod/mistral-579665f7c4-546bp condition met
+[11:34:44] Testing via port-forward...
+Handling connection for 8000
+E0904 11:34:47.410953 portforward.go:549] "An error occurred forwarding"
+  err="... failed to connect to localhost:8000 inside namespace \"...\":
+  dial tcp4 127.0.0.1:8000: connect: connection refused ..."
+error: lost connection to pod
+```
+
+This reads like a port-forward or CNI fault. It is neither. The model was fine —
+it just was not listening yet.
+
+### Root cause
+
+```bash
+kubectl wait pods --for=jsonpath='{.status.phase}'=Running -l model=mistral --timeout=300s
+...
+sleep 3
+curl -s http://localhost:8000/v1/completions ...
+```
+
+`phase == Running` means only that the container **process started**. vLLM then
+has to pull 9.7GB of weights from S3, load them onto the L40S and initialise the
+KV cache before it binds `:8000`. The deployment declares **no readinessProbe**,
+so nothing in the Kubernetes object model reflects that gap — the pod reads
+`1/1 Running` throughout.
+
+Measured on this run:
+
+| event | container clock |
+|---|---|
+| pod reaches `Running` (script proceeds) | `08:34:29` |
+| script's `sleep 3` expires, curl fires | `08:34:47` |
+| vLLM logs `Application startup complete` | `08:35:38` |
+
+The test ran **51 seconds** before the server existed. A fixed `sleep 3` was
+standing in for a 69-second model load.
+
+The pod-scoped error message is what makes this expensive to read: `connection
+refused` came from *inside the pod's own network namespace*, so it implicates the
+pod's networking rather than the timing. The port-forward was working correctly —
+it faithfully reported that nothing was listening on the other end.
+
+### Fix
+
+Poll vLLM's own `/health` from inside the pod until it answers (up to 300s),
+*then* send the completion. Also bail out early if the pod leaves `Running`,
+since a crash-looping or evicted pod will never become ready and there is no
+point burning the full five minutes to discover that.
+
+Verified with a stubbed `kubectl` across five paths: healthy immediately, ready
+after 13 polls (reports "roughly 70s", matching the 69s measured), never ready →
+`die` at 60 attempts, and pod phase leaving `Running` (`Failed` / `Succeeded`) →
+fail fast with the phase named.
+
+### The run itself succeeded
+
+Only the readiness check was wrong. Confirmed against the live deployment:
+
+```console
+$ kubectl exec deploy/mistral -- curl -sf -o /dev/null -w "health HTTP %{http_code}\n" \
+    http://localhost:8000/health
+health HTTP 200
+
+$ kubectl exec deploy/mistral -- curl -s http://localhost:8000/v1/completions \
+    -d '{"prompt":"San Francisco is a city that has","max_tokens":7,"temperature":0, ...}'
+completion: ' a lot of history and culture.'
+usage: {'prompt_tokens': 8, 'total_tokens': 15, 'completion_tokens': 7}
+```
+
+Ministral-3-8B, streamed from S3 by the Run:ai Streamer at `concurrency: 16`,
+serving from the on-demand L40S that AWS would not reserve.
