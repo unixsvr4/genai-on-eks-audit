@@ -58,7 +58,7 @@ Most people cloning this will be on a new or lightly-used AWS account, and this 
    ```bash
    aws freetier upgrade-account-plan --account-plan-type PAID
    ```
-   `00-prereqs.sh` now checks the account plan against the eligible-type set and refuses to let you walk into `02-gpu-infrastructure.sh` blind — that script creates a 4-hour capacity reservation billing $2.24/hr **before** it discovers whether a GPU node can launch.
+   `00-prereqs.sh` checks the account plan against the eligible-type set and **exits non-zero** on a FREE plan — it stops the run there rather than letting you walk into `01-deploy-infra.sh` (which bills for a NAT gateway and an EKS control plane, and *succeeds*, standing up a cluster the GPU node can never join) or `02-gpu-infrastructure.sh` (which creates a 4-hour capacity reservation billing $2.24/hr **before** it discovers whether a GPU node can launch). 02 gates independently, so skipping 00 does not get you past it. Override either with `ALLOW_FREE_TIER_BLOCKED=1` if you want to see it fail for yourself — you pay for that.
 
 3. **An interrupted `terraform apply` leaves a Helm release Terraform can't see.** If anything kills an apply partway, Helm may already hold a `kube-prometheus-stack` release record that never made it into Terraform state. The next apply then fails with `Error: installation failed ... cannot re-use a name that is still in use`, which looks like a Terraform bug and isn't. This bit the repo three times; as of `DIAGNOSTICS7.md`, `01-deploy-infra.sh` detects the orphan (failed/pending release **and** absent from `terraform state list`) and clears it automatically. A release Terraform *does* track is deliberately left alone. Manual equivalent:
    ```bash
@@ -71,7 +71,7 @@ Requires: `aws` CLI (authenticated), `kubectl`, `helm`, `terraform`, `docker`, `
 
 ```bash
 cd scripts
-./00-prereqs.sh              # checks tooling + quota, makes no changes
+./00-prereqs.sh              # checks tooling + account plan + quota; makes no changes, exits 1 if the account can't run this
 ./00-clone-terraform.sh      # vendors AWS's own Terraform at a pinned tag — see terraform/README.md
 ./01-deploy-infra.sh         # VPC + EKS Auto Mode cluster + GPU NodePool — ~20-25 min, billing starts here
 ./02-gpu-infrastructure.sh   # ODCR (auto-expires in 4h by default) + GPU NodeClass + nvidia-smi proof

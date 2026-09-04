@@ -213,12 +213,21 @@ it discovers whether a GPU node can launch — the ODCR was created at line 30,
 the first evidence of failure arrived at line 81. Closing that window is worth
 more than any amount of documentation, so the check now exists in two places:
 
-- `00-prereqs.sh` — advisory, tells you before you start.
-- `02-gpu-infrastructure.sh` — a **hard gate** that `die`s before the
-  `create-capacity-reservation` call. `00-prereqs.sh` can be skipped or
-  scrolled past; this one cannot. Escape hatch for anyone who wants to prove
-  it to themselves: `ALLOW_FREE_TIER_BLOCKED=1 ./02-gpu-infrastructure.sh`
-  (you will be billed for the reservation regardless).
+- `00-prereqs.sh` — a **hard stop** at the earliest possible moment, before a
+  single billable resource exists. This was originally advisory (warn, then
+  carry on to the quota and ODCR checks), on the reasoning that
+  `01-deploy-infra.sh` does succeed on a FREE plan. That reasoning was wrong:
+  01 succeeding is the trap, not the reprieve. It bills for a NAT gateway and
+  an EKS control plane to stand up a cluster whose whole purpose is a GPU node
+  that can never join it. A prereq check that knows the workshop is unrunnable
+  and lets you proceed anyway is not a prereq check.
+- `02-gpu-infrastructure.sh` — a second **hard gate** that `die`s before the
+  `create-capacity-reservation` call, for anyone who reaches it without having
+  run 00.
+
+Both take the same escape hatch, for anyone who wants to prove it to
+themselves: `ALLOW_FREE_TIER_BLOCKED=1 ./00-prereqs.sh` (and the same on 02 —
+you will be billed for the reservation regardless).
 
 Both call one `free_tier_check()` in `scripts/lib/env.sh`, so the advisory and
 the gate cannot drift apart. It returns 0 launchable / 1 blocked /

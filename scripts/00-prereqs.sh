@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Checks local tooling + AWS account state before you spend any money.
-# Run this FIRST. It makes no changes.
+# Run this FIRST. It makes no changes, and it is the only script in this repo
+# that can tell you the workshop is unrunnable BEFORE anything is billable.
+#
+# Exit codes: 0 = clear to proceed, 1 = a check refused (most importantly, the
+# account is on the FREE plan, which cannot launch the GPU instance type at all).
 set -euo pipefail
 cd "$(dirname "$0")"
 source lib/env.sh
@@ -57,9 +61,14 @@ log "Authenticated as: ${MASKED_ARN} (account ${MASKED_ACCOUNT})"
 # So this gate is authoritative instead of empirical: ask what plan the account is on,
 # ask which types that plan permits, and compare. Zero cost, no cluster, no launch
 # template, and it runs correctly before anything has been deployed.
+#
+# A FREE plan is FATAL here, not advisory. This used to warn and let the run continue
+# to 01, on the reasoning that 01 itself succeeds on a FREE plan -- but 01 succeeding
+# is precisely the trap: it bills for a NAT gateway and an EKS control plane to stand
+# up a cluster whose entire purpose is a GPU node that can never join it.
 PLAN_BLOCKS_GPU=0
 # Shared with 02-gpu-infrastructure.sh via free_tier_check() in lib/env.sh, so the
-# advisory check here and the hard gate there can never disagree.
+# two gates can never disagree about what this account can launch.
 log "Checking the account's Free Tier plan (this gates which instance types can launch at all)..."
 set +e
 free_tier_check "$INSTANCE_TYPE"
@@ -76,11 +85,11 @@ case "$FT_RC" in
   1)
     warn "This account is on the FREE plan. It can ONLY launch these instance types in ${AWS_REGION}:"
     warn "  $(echo "$FT_ELIGIBLE_TYPES" | tr '\n' ' ')"
-    warn "${INSTANCE_TYPE} is NOT among them, so 02-gpu-infrastructure.sh CANNOT launch a GPU node on this account, no matter what the GPU quota says."
+    warn "${INSTANCE_TYPE} is NOT among them, so no script in this repo can launch a GPU node on this account, no matter what the GPU quota says."
     warn "This does NOT clear by waiting — it is the account's plan, not a temporary validation hold. Upgrade first:"
     warn "  aws freetier upgrade-account-plan --account-plan-type PAID"
     warn "  (or: AWS Billing console -> Free Tier -> 'Upgrade to a paid plan')"
-    warn "Until then, DO NOT run 02-gpu-infrastructure.sh: it creates a ${ODCR_HOURS}h On-Demand Capacity Reservation that bills the full ${INSTANCE_TYPE} rate from the moment it is created, for capacity no node will ever be able to occupy. (That script now refuses on its own too.)"
+    warn "Then re-run this script. It will pass once the plan reads PAID."
     PLAN_BLOCKS_GPU=1
     # 01-deploy-infra.sh survives a FREE plan only because Karpenter's system and
     # general-purpose pools accept a wide instance-type range and can fall back to an
@@ -88,8 +97,25 @@ case "$FT_RC" in
     # pinned to exactly one type, so it has no fallback — that asymmetry is why
     # DIAGNOSTICS0-7 read the failure as "intermittent, seems to be clearing".
     if ! echo "$FT_ELIGIBLE_TYPES" | grep -qE '^(c7i-flex|m7i-flex)\.large$'; then
-      warn "No flex-class type is Free-Tier-eligible in ${AWS_REGION} either — 01-deploy-infra.sh's system/general-purpose NodePools may not find a launchable type here at all."
+      warn "No flex-class type is Free-Tier-eligible in ${AWS_REGION} either — 01-deploy-infra.sh's system/general-purpose NodePools would not find a launchable type here at all."
     fi
+    # STOP HERE. Everything below this point (quota, ODCR, and every later script)
+    # is moot on a FREE plan: 02-gpu-infrastructure.sh creates a ${ODCR_HOURS}h On-Demand
+    # Capacity Reservation that bills the full ${INSTANCE_TYPE} rate from the moment it
+    # is created, for capacity no node will ever be able to occupy, and 01 stands up a
+    # NAT gateway + EKS control plane that can never run the workshop's GPU workload.
+    # The whole point of this script is to fail here rather than there.
+    warn "----------------------------------------------------------------------"
+    warn "STOPPING. Do not run 01-deploy-infra.sh or 02-gpu-infrastructure.sh on"
+    warn "this account: the GPU node they exist to create cannot be launched, and"
+    warn "both of them bill for real (NAT gateway + EKS control plane; a ${ODCR_HOURS}h"
+    warn "capacity reservation) while producing nothing. See DIAGNOSTICS8.md."
+    warn "----------------------------------------------------------------------"
+    warn "To override anyway — knowingly paying for infrastructure that cannot work:"
+    warn "  ALLOW_FREE_TIER_BLOCKED=1 ./00-prereqs.sh"
+    [ "${ALLOW_FREE_TIER_BLOCKED:-0}" = "1" ] \
+      || die "Account plan is FREE and ${INSTANCE_TYPE} is not launchable on it. Nothing was created, nothing was billed."
+    warn "ALLOW_FREE_TIER_BLOCKED=1 set — continuing the remaining checks anyway."
     ;;
   *)
     warn "Could not read the account plan (needs aws-cli >= 2.22 and freetier:GetAccountPlanState). Skipping the Free Tier gate — if 01/02 later churn NodeClaims with 'FreeTierIneligible', this is why. Check manually:"
@@ -123,12 +149,15 @@ if [ "$EXISTING_ODCR" != "None" ] && [ -n "$EXISTING_ODCR" ]; then
   warn "Found an existing active ODCR for ${INSTANCE_TYPE}: ${EXISTING_ODCR}. 01-deploy-infra.sh will reuse it rather than creating a second one — verify this is one you expect."
 fi
 
+# Only reachable when the FREE-plan stop above was explicitly overridden.
 if [ "$PLAN_BLOCKS_GPU" -eq 1 ]; then
   warn "----------------------------------------------------------------------"
-  warn "SUMMARY: 01-deploy-infra.sh can run, but 02-gpu-infrastructure.sh cannot"
-  warn "succeed on this account's FREE plan — ${INSTANCE_TYPE} is not launchable."
-  warn "Upgrade to a paid plan before running 02, or you will pay for an unusable"
-  warn "capacity reservation. See DIAGNOSTICS8.md."
+  warn "SUMMARY: this account is on the FREE plan and ${INSTANCE_TYPE} is NOT"
+  warn "launchable on it. You overrode the stop with ALLOW_FREE_TIER_BLOCKED=1."
+  warn "Every check printed after that point is advisory only — the quota and the"
+  warn "capacity reservation are irrelevant while the plan itself refuses the"
+  warn "launch. 02-gpu-infrastructure.sh will still refuse on its own. Upgrade to"
+  warn "a paid plan first. See DIAGNOSTICS8.md."
   warn "----------------------------------------------------------------------"
 fi
 
