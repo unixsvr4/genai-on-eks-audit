@@ -783,7 +783,42 @@ same state in two different ways. All three branches verified: the misconfigured
 case emits the working socket path and the exact two commands, and the genuinely
 absent case (probed with `HOME=/tmp`) falls through to "start one".
 
-The underlying situation resolved itself — OrbStack finished initialising and
-created `/var/run/docker.sock` a few minutes later, which is its own lesson: the
-first symptom was a startup race, and the confident diagnosis of it was wrong in
-both directions at once.
+**Correction.** An earlier revision of this section claimed the situation
+"resolved itself" when OrbStack finished initialising and created
+`/var/run/docker.sock`. That was wrong, and asserted for the same reason as
+everything else here — Docker started working, and a cause was assumed instead of
+checked. `/var/run/docker.sock` was never created:
+
+```console
+$ ls -l /var/run/docker.sock
+No such file or directory
+
+$ DOCKER_HOST=unix:///var/run/docker.sock docker info --format '{{.ServerVersion}}'
+(fails)
+
+$ docker context ls --format '{{.Name}} current={{.Current}}'
+default  current=false
+orbstack current=true
+```
+
+Docker works because the **user ran the two `docker context` commands**. The
+`default` context is still broken and always was. There was no startup race.
+
+### Auto-repair
+
+Printing two commands for someone to retype, on every run, is not a fix — so
+`00-prereqs.sh` now performs the repair when `docker_daemon_check()` returns 1,
+i.e. only after a daemon has been **proven** to answer on the discovered socket.
+`docker_daemon_autofix()` names the context after the detected runtime
+(`orbstack` / `colima` / `rancher-desktop` / `desktop-linux`), creates it — or
+`update`s it if it already exists, so a re-run is idempotent — points it at the
+socket, selects it, and re-verifies with `docker info`.
+
+This is the one change `00-prereqs.sh` makes, and its header now says so instead
+of claiming it changes nothing. It is docker-CLI config only: no AWS call, no
+cluster call, no cost, and `docker context use default` undoes it.
+
+Verified against a throwaway `DOCKER_CONFIG`, so the real config was untouched
+during the test: from a simulated broken state it created `orbstack ->
+unix://<home>/.orbstack/run/docker.sock`, made it current, confirmed
+`29.4.0 / OrbStack`, and a second run returned 0 without duplicating anything.

@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Checks local tooling + AWS account state before you spend any money.
-# Run this FIRST. It makes no changes, and it is the only script in this repo
-# that can tell you the workshop is unrunnable BEFORE anything is billable.
+# Run this FIRST. It creates nothing and costs nothing, and it is the only script
+# in this repo that can tell you the workshop is unrunnable BEFORE anything is
+# billable. The single change it can make is local and reversible: if a Docker
+# daemon is running but your docker CLI points at a socket that does not exist,
+# it repoints the CLI (docker context only -- no AWS call, no cluster call).
 #
 # Exit codes: 0 = clear to proceed, 1 = a check refused (most importantly, the
 # account is on the FREE plan, which cannot launch the GPU instance type at all).
@@ -33,14 +36,33 @@ set +e
 docker_daemon_check
 DOCKER_RC=$?
 set -e
-if [ "$DOCKER_RC" -eq 0 ]; then
-  log "Docker daemon is reachable."
-else
-  warn "Docker CLI is installed but 'docker info' failed."
-  warn "Only 05-agentic-app.sh needs the daemon (it builds and pushes the Strands agent image); 00-04 and 06-11 do not."
-  while IFS= read -r line; do warn "$line"; done <<< "$(docker_daemon_advice)"
-  DOCKER_DAEMON_DOWN=1
-fi
+case "$DOCKER_RC" in
+  0)
+    log "Docker daemon is reachable."
+    ;;
+  1)
+    # A daemon IS running; the docker CLI is just pointed at a socket that does
+    # not exist. Repair it here rather than printing two commands to retype --
+    # this is the one local change this script makes (docker CLI config only:
+    # no AWS call, no cluster call, no cost, undo with 'docker context use default').
+    warn "'docker info' failed, but a Docker daemon IS running at ${DOCKER_ALT_SOCK}."
+    warn "Your docker context was pointing somewhere else. Repointing it..."
+    if docker_daemon_autofix; then
+      log "Docker now works via context '${DOCKER_CTX_NAME}' -> unix://${DOCKER_ALT_SOCK}"
+      log "  (this persists across shells; undo with: docker context use default)"
+    else
+      warn "Could not repoint the docker context automatically. Do it by hand:"
+      while IFS= read -r line; do warn "$line"; done <<< "$(docker_daemon_advice)"
+      DOCKER_DAEMON_DOWN=1
+    fi
+    ;;
+  *)
+    warn "Docker CLI is installed but 'docker info' failed."
+    warn "Only 05-agentic-app.sh needs the daemon (it builds and pushes the Strands agent image); 00-04 and 06-11 do not."
+    while IFS= read -r line; do warn "$line"; done <<< "$(docker_daemon_advice)"
+    DOCKER_DAEMON_DOWN=1
+    ;;
+esac
 
 log "Checking AWS identity..."
 # Masked rather than printed raw (account ID + ARN would otherwise land in

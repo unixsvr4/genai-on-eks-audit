@@ -285,3 +285,33 @@ docker_daemon_advice() {
     echo "  start one -- e.g. 'open -a OrbStack' or 'open -a Docker' -- then re-check with 'docker info'."
   fi
 }
+
+# Point the docker CLI at a daemon that docker_daemon_check() found but the
+# current context is not using. Only ever called after that returned 1, i.e. we
+# have already PROVEN a daemon answers on DOCKER_ALT_SOCK.
+#
+# This is a local docker-CLI config change and nothing else: no AWS call, no
+# cluster call, no cost. Fully reversible with `docker context use default`.
+# It exists because printing two commands for the user to retype, every time,
+# is not a fix -- and this situation recurs on any machine where OrbStack (or
+# Colima, etc.) owns the daemon but never claimed /var/run/docker.sock.
+#
+# Sets DOCKER_CTX_NAME. Returns 0 if docker works afterwards, 1 otherwise.
+docker_daemon_autofix() {
+  [ -n "${DOCKER_ALT_SOCK:-}" ] || return 1
+  case "$DOCKER_ALT_SOCK" in
+    *".orbstack"*) DOCKER_CTX_NAME="orbstack" ;;
+    *".colima"*)   DOCKER_CTX_NAME="colima" ;;
+    *".rd"*)       DOCKER_CTX_NAME="rancher-desktop" ;;
+    *)             DOCKER_CTX_NAME="desktop-linux" ;;
+  esac
+  if docker context inspect "$DOCKER_CTX_NAME" >/dev/null 2>&1; then
+    docker context update "$DOCKER_CTX_NAME" \
+      --docker "host=unix://${DOCKER_ALT_SOCK}" >/dev/null 2>&1 || return 1
+  else
+    docker context create "$DOCKER_CTX_NAME" \
+      --docker "host=unix://${DOCKER_ALT_SOCK}" >/dev/null 2>&1 || return 1
+  fi
+  docker context use "$DOCKER_CTX_NAME" >/dev/null 2>&1 || return 1
+  docker info >/dev/null 2>&1
+}
