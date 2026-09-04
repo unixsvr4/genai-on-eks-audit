@@ -1112,3 +1112,54 @@ Auto Mode nodes cannot outlive their cluster.
 - `aws_s3_bucket.model_storage` carries `force_destroy = true`, so the 9.7GB of
   model weights will not block `terraform destroy` — worth confirming rather than
   discovering at the end of a destroy.
+
+
+---
+
+## Postscript 8 — the LoRA-serving step that failed at the live event now works
+
+`09-customize-model-lora.sh` has carried a `*** KNOWN FAILURE MODE ***` banner
+since the original capture: the fine-tune succeeded, but **serving** the adapter
+failed. The stated cause was that the Mountpoint-for-S3 CSI driver holds live IAM
+credentials for the whole lifetime of the mount — unlike the Run:ai-streamer
+pattern used everywhere else in this repo, which needs them only at load time —
+and the workshop's temporary account expired its session role mid-module.
+
+The header made a falsifiable prediction: *"in YOUR OWN account with your own
+long-lived credentials this specific failure mode shouldn't recur."*
+
+It held. Both halves of the module completed:
+
+```console
+[8/8] Saving adapter...
+  Loss: 0.1802 | Runtime: 169s | Size: 83.3 MB
+  Uploaded to s3://<bucket>/anyvc-startup-lora/
+
+pod/anyvc-69c9d75c4c-ttrsl condition met
+{ "model": "anyvc-startup-expert", "choices": [ ... 264 completion tokens ... ] }
+```
+
+Verified that the risky path was genuinely exercised rather than bypassed:
+
+```console
+$ kubectl get pv s3-bucket-pv -o jsonpath='{.spec.csi.driver}'
+s3.csi.aws.com
+
+$ kubectl get pods -l model=anyvc
+anyvc-69c9d75c4c-ttrsl   1/1   Running   0   3m8s
+
+$ aws s3 ls s3://<bucket>/anyvc-startup-lora/ --summarize
+Total Objects: 4    Total Size: 83.3 MiB
+```
+
+So the failure was **environmental, not architectural** — the credentials
+differed, the design did not. The banner is rewritten to record the result rather
+than warn about a failure that is no longer open, but the dependency note stays:
+it is unchanged, and it is still the first thing to check if that pod hangs in
+`ContainerCreating`.
+
+This is also the first module where the readiness work from Postscripts 2 and 3
+mattered rather than merely helped. Under the old `sleep 3`, this step would have
+been tested about 60 seconds before vLLM finished loading base model + adapter,
+failed, and been recorded as the documented LoRA problem recurring — closing a
+genuine open question with a fabricated answer.

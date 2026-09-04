@@ -3,7 +3,19 @@
 # Fine-tunes a LoRA adapter on a small "AnyVC Startup Advisor" dataset, then attempts
 # to serve base model + adapter together via an S3-backed PersistentVolume.
 #
-# *** KNOWN FAILURE MODE, READ BEFORE RUNNING ***
+# *** RESOLVED 2026-09-04 -- kept because the dependency is still real ***
+# This step DID succeed in this account. The hypothesis below ("in YOUR OWN account
+# ... this specific failure mode shouldn't recur") was tested and held: the pod came
+# up, the Mountpoint-for-S3 CSI mount stayed healthy, and vLLM served the adapter:
+#     pod -l model=anyvc            1/1 Running
+#     pv s3-bucket-pv driver        s3.csi.aws.com
+#     s3://<bucket>/anyvc-startup-lora/   83.3 MiB, 4 objects
+#     POST /v1/chat/completions to model "anyvc-startup-expert" -> 264 tokens
+# So this is no longer an open failure. The warning stays because the underlying
+# dependency has not changed -- it was the credentials that were different, not the
+# design -- and it is still the right thing to check first if the pod hangs.
+#
+# *** ORIGINAL KNOWN FAILURE MODE ***
 # In the live workshop run, the fine-tuning job succeeded cleanly (loss 2.5 -> 0.07),
 # but the LoRA-SERVING step failed: the S3-backed PV (Mountpoint-for-S3 CSI driver)
 # depends on live IAM credentials for the ENTIRE lifetime of the pod's mount — unlike
