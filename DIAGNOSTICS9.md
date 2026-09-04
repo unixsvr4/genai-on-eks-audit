@@ -902,3 +902,49 @@ and confirmed not to regress the healthy path (`svc/vllm-serve-svc` with
 `model=mistral`: `rc=0 elapsed=3s`, `HTTP 200` through the forward). 05 turns
 return 2 into a message that names architecture explicitly, since `exec format
 error` does not.
+
+### ...and the crash-loop guard then aborted a healthy rollout
+
+The amd64 rebuild pushed correctly — `manylinux_2_17_x86_64` wheels this time —
+and 05 still failed, one second in:
+
+```console
+[12:01:22] deployment.apps/strands-weather-agent configured
+           pod/strands-weather-agent-67cf778554-kmh8t condition met
+           pod/strands-weather-agent-67f66d84d-w9tp4 condition met
+[12:01:35] FATAL: The strands agent pod is failing and will not recover:
+           strands-weather-agent: exited 255, 6 restarts
+```
+
+Two pods, two ReplicaSets. `67cf778554-kmh8t` is the **old arm64 pod being
+replaced**; `67f66d84d-w9tp4` is the new amd64 one, which came up fine:
+
+```console
+$ kubectl logs strands-weather-agent-67f66d84d-w9tp4
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000
+```
+
+The guard selected on `app=strands-weather-agent`, which matches pods from
+**both** ReplicaSets during a rollout. It found the corpse of the very pod the
+deploy was fixing and used it to abort the wait for its healthy replacement.
+
+This is a nastier version of the same mistake as everywhere else in this round:
+it looked at *a* pod rather than *the* pod, and a label selector is not an
+identity. The failure mode is specifically perverse — the guard is most likely to
+misfire exactly when you are redeploying to fix a broken revision, which is the
+only time it gets used.
+
+**Fix**: consider only the newest pod that is not already being deleted — filter
+on `metadata.deletionTimestamp`, then take the max by `creationTimestamp`.
+
+Verified against the live deployment after the rollout settled: `rc=0` in 3s, and
+05's own test payload answered correctly through the forward —
+
+```console
+$ curl -s -X POST http://localhost:8080/agent -d '{"query": "What time is it in Dallas?"}'
+The current time in Dallas is **11:03 AM CDT** (Central Daylight Time).
+```
+
+which is tool-calling working end to end against the vLLM backend. 05 had in fact
+succeeded; only the guard disagreed.

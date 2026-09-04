@@ -230,21 +230,29 @@ pf_start() {
   PF_ABORT_REASON=""
   while [ "$(date +%s)" -lt "$deadline" ]; do
     if [ -n "$selector" ]; then
+      # Only judge the NEWEST pod that is not already being deleted. During a
+      # rollout the selector matches the old ReplicaSet's pod too, and if the
+      # previous revision was the broken one -- which is exactly why you are
+      # redeploying -- its corpse would abort the wait for the fixed pod that is
+      # coming up healthy beside it. Observed live 2026-09-04: an amd64 rebuild
+      # was aborted by the arm64 pod it had just replaced.
       PF_ABORT_REASON=$(kubectl get pods -l "$selector" -o json 2>/dev/null | python3 -c '
 import json,sys
 try: pods=json.load(sys.stdin).get("items",[])
 except Exception: sys.exit(0)
-for p in pods:
-    for c in p.get("status",{}).get("containerStatuses",[]):
-        st=c.get("state",{})
-        w=st.get("waiting") or {}
-        if w.get("reason") in ("CrashLoopBackOff","ImagePullBackOff","ErrImagePull","CreateContainerError"):
-            print("%s: %s (%s restarts)" % (c["name"], w["reason"], c.get("restartCount",0)))
-            sys.exit(0)
-        t=st.get("terminated") or {}
-        if t.get("exitCode") and c.get("restartCount",0) >= 3:
-            print("%s: exited %s, %s restarts" % (c["name"], t["exitCode"], c["restartCount"]))
-            sys.exit(0)
+pods=[p for p in pods if not p["metadata"].get("deletionTimestamp")]
+if not pods: sys.exit(0)
+p=max(pods, key=lambda x: x["metadata"].get("creationTimestamp",""))
+for c in p.get("status",{}).get("containerStatuses",[]):
+    st=c.get("state",{})
+    w=st.get("waiting") or {}
+    if w.get("reason") in ("CrashLoopBackOff","ImagePullBackOff","ErrImagePull","CreateContainerError"):
+        print("%s: %s (%s restarts)" % (c["name"], w["reason"], c.get("restartCount",0)))
+        sys.exit(0)
+    t=st.get("terminated") or {}
+    if t.get("exitCode") and c.get("restartCount",0) >= 3:
+        print("%s: exited %s, %s restarts" % (c["name"], t["exitCode"], c["restartCount"]))
+        sys.exit(0)
 ' 2>/dev/null || echo "")
       if [ -n "$PF_ABORT_REASON" ]; then return 2; fi
     fi
