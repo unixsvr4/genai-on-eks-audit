@@ -212,7 +212,38 @@ EOF
 
 log "Waiting for GPU node to provision + pod to succeed (expect ~30s-1min, first cold GPU node from zero)..."
 kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/nvidia-smi --timeout=300s
-kubectl logs nvidia-smi
+
+# `kubectl logs` is proxied by the API server to the node's kubelet on :10250, so it
+# needs the kubelet's SERVING certificate -- which is issued via a CSR that is still
+# being approved when a brand-new node's first pod finishes. On a cold GPU node the
+# pod therefore completes before logs are readable, and the first fetch fails with:
+#     Error from server: Get "https://<node-ip>:10250/containerLogs/...":
+#     remote error: tls: internal error
+# That is the certificate not existing yet, not a GPU or pod problem. Retry briefly.
+# Observed live 2026-09-04: the pod hit Succeeded, the immediate log fetch failed,
+# and a manual retry seconds later returned the full nvidia-smi table.
+log "Fetching nvidia-smi output (retrying while the new node's kubelet serving cert is issued)..."
+for attempt in 1 2 3 4 5 6 7 8 9 10; do
+  set +e
+  SMI_OUT=$(kubectl logs nvidia-smi 2>&1)
+  RC=$?
+  set -e
+  if [ "$RC" -eq 0 ]; then
+    echo "$SMI_OUT"
+    break
+  fi
+  case "$SMI_OUT" in
+    *"tls: internal error"*|*"connection refused"*|*"i/o timeout"*)
+      [ "$attempt" -eq 10 ] && die "Could not read nvidia-smi logs after 10 attempts. The pod SUCCEEDED, so the GPU almost certainly works -- this is a kubelet-cert/reachability problem. Last error:
+${SMI_OUT}"
+      sleep 5
+      ;;
+    *)
+      die "kubectl logs nvidia-smi failed for an unexpected reason:
+${SMI_OUT}"
+      ;;
+  esac
+done
 kubectl delete pod nvidia-smi
 
 log "GPU infrastructure verified. Next: ./03-serve-model.sh"

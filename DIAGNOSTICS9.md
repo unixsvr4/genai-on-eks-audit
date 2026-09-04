@@ -472,3 +472,46 @@ with `create-capacity-reservation` stubbed, so nothing was created:
 | `us-east-2c` only | warns on `2a` and `2b`, reserves in `2c` |
 | none | warns per AZ, continues with no ODCR, exit 0 |
 | n/a — `UnauthorizedOperation` | `die`s on the first AZ, does not retry |
+
+### The result, and the finding that came with it
+
+On the re-run, **all three AZs refused the reservation** — so the new degraded
+path was exercised on its first outing:
+
+```console
+[11:27:32]   AZs to try: us-east-2a us-east-2b us-east-2c
+[11:27:36] WARNING:   us-east-2a: no g6e.2xlarge capacity right now — trying the next AZ.
+[11:27:39] WARNING:   us-east-2b: no g6e.2xlarge capacity right now — trying the next AZ.
+[11:27:41] WARNING:   us-east-2c: no g6e.2xlarge capacity right now — trying the next AZ.
+[11:27:42] Clearing any capacityReservationSelectorTerms from the GPU NodeClass (running on-demand)...
+[11:27:44] Waiting for GPU node to provision + pod to succeed...
+pod/nvidia-smi condition met
+```
+
+**The on-demand node launched immediately — in `us-east-2b`**, one of the zones
+that had just refused a reservation seconds earlier:
+
+```console
+$ kubectl get nodeclaims
+NAME          TYPE          CAPACITY    ZONE         NODE                  READY   AGE
+gpu-plv6n     g6e.2xlarge   on-demand   us-east-2b   i-01322b19ae60793d1   True    115s
+```
+
+```console
+$ kubectl logs nvidia-smi
+| NVIDIA-SMI 580.159.03    Driver Version: 580.159.03    CUDA Version: 13.0     |
+|   0  NVIDIA L40S    On  | 00000000:30:00.0 Off |    0 |
+| N/A   42C    P0    88W / 350W |   0MiB / 46068MiB |  0%   Default |
+```
+
+So: **`CreateCapacityReservation` failing with `InsufficientInstanceCapacity` in
+every AZ does not mean an on-demand launch of the same instance type will fail.**
+Reserving capacity is a strictly harder ask than consuming it — a reservation
+requires AWS to set capacity aside and hold it, while a launch only needs a slot
+at that instant. Measured here as a total inversion: 3/3 AZs refused the
+reservation, and the launch succeeded in one of them within seconds.
+
+This is the empirical justification for the degraded path. Had the script kept
+its original behaviour — die on the first `InsufficientInstanceCapacity` — the
+workshop would have been blocked by a reservation it never actually needed, on a
+region that had the GPU available the whole time.
