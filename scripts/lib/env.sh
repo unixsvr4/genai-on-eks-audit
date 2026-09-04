@@ -214,14 +214,40 @@ lb_hostname() {
 # Any HTTP response counts as ready -- a 404 still proves something is listening,
 # and not every service has a /health.
 #
-# Usage: pf_start <svc/name> <localport>:<remoteport> [path]
-# Sets PF_PID on success. Returns 1 on timeout (PF_PID left empty).
+# Pass a pod selector as the 4th argument and this also gives up early on a pod
+# that can NEVER become ready, instead of waiting out the full timeout. Observed
+# live 2026-09-04: an arm64 image on an amd64 node crash-looped with "exec format
+# error", and without this the caller sat polling a doomed pod for 5 minutes.
+#
+# Usage: pf_start <svc/name> <localport>:<remoteport> [path] [pod-selector]
+# Sets PF_PID on success. Returns 1 on timeout, 2 if the backing pod is failing
+# (reason in PF_ABORT_REASON). PF_PID is left empty on both failures.
 pf_start() {
-  local target="$1" ports="$2" path="${3:-/}"
+  local target="$1" ports="$2" path="${3:-/}" selector="${4:-}"
   local lport="${ports%%:*}"
   local deadline=$(( $(date +%s) + ${PF_TIMEOUT:-300} ))
   PF_PID=""
+  PF_ABORT_REASON=""
   while [ "$(date +%s)" -lt "$deadline" ]; do
+    if [ -n "$selector" ]; then
+      PF_ABORT_REASON=$(kubectl get pods -l "$selector" -o json 2>/dev/null | python3 -c '
+import json,sys
+try: pods=json.load(sys.stdin).get("items",[])
+except Exception: sys.exit(0)
+for p in pods:
+    for c in p.get("status",{}).get("containerStatuses",[]):
+        st=c.get("state",{})
+        w=st.get("waiting") or {}
+        if w.get("reason") in ("CrashLoopBackOff","ImagePullBackOff","ErrImagePull","CreateContainerError"):
+            print("%s: %s (%s restarts)" % (c["name"], w["reason"], c.get("restartCount",0)))
+            sys.exit(0)
+        t=st.get("terminated") or {}
+        if t.get("exitCode") and c.get("restartCount",0) >= 3:
+            print("%s: exited %s, %s restarts" % (c["name"], t["exitCode"], c["restartCount"]))
+            sys.exit(0)
+' 2>/dev/null || echo "")
+      if [ -n "$PF_ABORT_REASON" ]; then return 2; fi
+    fi
     kubectl port-forward "$target" "$ports" >/dev/null 2>&1 &
     PF_PID=$!
     local inner=$(( $(date +%s) + 15 ))

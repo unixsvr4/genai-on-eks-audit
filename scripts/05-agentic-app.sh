@@ -40,7 +40,16 @@ aws ecr describe-repositories --repository-names strands-weather-agent >/dev/nul
 ECR_REPO=$(aws ecr describe-repositories --repository-names strands-weather-agent --query 'repositories[0].repositoryUri' --output text)
 export ECR_REPO
 aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$(echo "$ECR_REPO" | cut -d'/' -f1)"
-docker build -t strands-weather-agent "${MANIFEST_DIR}/600-strands-agent"
+# --platform is REQUIRED, not cosmetic. `docker build` with no platform builds for
+# the BUILD HOST, and on Apple Silicon that is arm64 -- which lands on an amd64 EKS
+# node and dies with a message that says nothing about architecture:
+#     exec /usr/local/bin/python: exec format error
+# The cluster is mixed (EKS Auto Mode ran c6g.large/arm64 for system and
+# c6a.large/amd64 for general-purpose), so "whatever the host is" is wrong even by
+# accident. Pin the image to amd64 here and pin the POD to amd64 below, so the two
+# cannot disagree.
+log "Building for linux/amd64 (build host is $(uname -m); EKS Auto Mode's general-purpose nodes are amd64)..."
+docker build --platform linux/amd64 -t strands-weather-agent "${MANIFEST_DIR}/600-strands-agent"
 docker tag strands-weather-agent:latest "${ECR_REPO}:latest"
 docker push "${ECR_REPO}:latest"
 
@@ -58,6 +67,11 @@ spec:
     metadata:
       labels: { app: strands-weather-agent }
     spec:
+      # Must match the --platform the image was built for. Without this the pod can
+      # be scheduled onto the arm64 system node and fail with "exec format error"
+      # even though the image is correct for the nodes it was meant to run on.
+      nodeSelector:
+        kubernetes.io/arch: amd64
       containers:
       - name: strands-weather-agent
         image: $ECR_REPO:latest
@@ -86,8 +100,17 @@ log "Testing tool-calling end to end..."
 # the same misleading "connection refused inside namespace" failure that
 # 03-serve-model.sh hit (DIAGNOSTICS9.md) -- so wait for the port to actually
 # answer instead.
-pf_start svc/strands-weather-agent 8080:80 \
-  || die "The strands agent never answered on :8080. Check: kubectl logs -l app=strands-weather-agent"
+set +e
+pf_start svc/strands-weather-agent 8080:80 / app=strands-weather-agent
+PF_RC=$?
+set -e
+case "$PF_RC" in
+  0) ;;
+  2) die "The strands agent pod is failing and will not recover: ${PF_ABORT_REASON}
+If that says 'exec format error' in the logs, the image architecture does not match the node -- this script builds --platform linux/amd64 and pins the pod to amd64 for exactly that reason.
+Check: kubectl logs -l app=strands-weather-agent" ;;
+  *) die "The strands agent never answered on :8080 within ${PF_TIMEOUT:-300}s. Check: kubectl logs -l app=strands-weather-agent" ;;
+esac
 curl -s -X POST http://localhost:8080/agent -H "Content-Type: application/json" \
   -d '{"query": "What time is it in Dallas?"}' | jq -r '.response.message.content[0].text'
 curl -s -X POST http://localhost:8080/agent -H "Content-Type: application/json" \

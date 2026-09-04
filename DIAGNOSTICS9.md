@@ -822,3 +822,83 @@ Verified against a throwaway `DOCKER_CONFIG`, so the real config was untouched
 during the test: from a simulated broken state it created `orbstack ->
 unix://<home>/.orbstack/run/docker.sock`, made it current, confirmed
 `29.4.0 / OrbStack`, and a second run returned 0 without duplicating anything.
+
+---
+
+## Postscript 5 — an arm64 image on an amd64 node
+
+`05-agentic-app.sh` built and pushed cleanly, deployed, and then the pod said:
+
+```console
+$ kubectl get pods -l app=strands-weather-agent
+NAME                                     READY   STATUS   RESTARTS      AGE
+strands-weather-agent-67cf778554-kmh8t   0/1     Error    5 (97s ago)   3m21s
+
+$ kubectl logs -l app=strands-weather-agent
+exec /usr/local/bin/python: exec format error
+```
+
+`exec format error` is the kernel refusing a binary built for another
+architecture. Nothing in the message says so.
+
+### Root cause
+
+```bash
+docker build -t strands-weather-agent "${MANIFEST_DIR}/600-strands-agent"
+```
+
+No `--platform`, so Docker builds for the **build host** — an Apple Silicon Mac.
+The build log said so all along, in the wheel names:
+
+```
+pydantic_core-2.46.4-cp312-cp312-manylinux_2_17_aarch64...whl
+numpy-2.5.2-cp312-cp312-manylinux_2_27_aarch64...whl
+```
+
+The cluster is **mixed-architecture**, which makes "whatever the host is" wrong
+even by accident:
+
+```console
+$ kubectl get nodes -o custom-columns=NAME:.metadata.name,ARCH:.status.nodeInfo.architecture
+i-<gpu>       amd64      # g6e.2xlarge
+i-<system>    arm64      # c6g.large
+i-<general>   amd64      # c6a.large
+```
+
+EKS Auto Mode picked `c6g.large` (Graviton) for the system pool and `c6a.large`
+for general-purpose. An unpinned image would have been wrong on one of them
+whichever way the build host had gone, and upstream's Deployment has no
+`nodeSelector`, so placement was luck.
+
+### Fix
+
+Pin **both** halves, so they cannot disagree:
+
+- `docker build --platform linux/amd64` — the image
+- `nodeSelector: { kubernetes.io/arch: amd64 }` on the Deployment — the placement
+
+Pinning only the image would still allow the pod onto the arm64 system node;
+pinning only the pod would still ship an arm64 binary. This is the same class as
+the ODCR AZ bug — a single hardcoded assumption where the surrounding system is
+heterogeneous.
+
+### And a weakness in the fix from Postscript 3
+
+`pf_start` polled this doomed pod for the full 300s. It was waiting correctly for
+something that was never going to happen: the pod had already restarted 5 times
+with a permanent error. Correct behaviour, useless outcome.
+
+`pf_start` now takes an optional pod selector and gives up immediately on a pod
+that **cannot** become ready — `CrashLoopBackOff`, `ImagePullBackOff`,
+`ErrImagePull`, `CreateContainerError`, or a non-zero exit with 3+ restarts —
+returning 2 with the reason in `PF_ABORT_REASON`. Verified against this exact
+live failure:
+
+```console
+rc=2 elapsed=0s reason='strands-weather-agent: CrashLoopBackOff (5 restarts)'
+```
+
+and confirmed not to regress the healthy path (`svc/vllm-serve-svc` with
+`model=mistral`: `rc=0 elapsed=3s`, `HTTP 200` through the forward). 05 turns
+return 2 into a message that names architecture explicitly, since `exec format
+error` does not.

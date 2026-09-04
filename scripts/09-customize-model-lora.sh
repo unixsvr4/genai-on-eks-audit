@@ -66,8 +66,14 @@ else
   # `sleep 3` here was especially bad: this script documents LoRA SERVING as a
   # known-risk step, so a purely-timing failure would be misread as the real
   # LoRA problem. Wait for /health, then ask.
-  pf_start svc/vllm-serve-svc 8000:8000 /health \
-    || die "The LoRA-serving vLLM never answered on :8000. This IS the failure mode this script warns about -- check: kubectl logs -l model=anyvc"
+  set +e
+  pf_start svc/vllm-serve-svc 8000:8000 /health model=anyvc
+  PF_RC=$?
+  set -e
+  if [ "$PF_RC" -ne 0 ]; then
+    [ "$PF_RC" -eq 2 ] && warn "Pod is failing and will not recover: ${PF_ABORT_REASON}"
+    die "The LoRA-serving vLLM never answered on :8000. This IS the failure mode this script warns about -- check: kubectl logs -l model=anyvc"
+  fi
   curl -s http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" -d '{
     "model": "anyvc-startup-expert",
     "messages": [{"role": "user", "content": "We are building TalentPulse, an AI recruiting platform for nurses. 40 nurses placed across 8 hospitals in 3 months, $200K revenue."}],
