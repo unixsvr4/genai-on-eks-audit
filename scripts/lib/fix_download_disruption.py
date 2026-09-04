@@ -4,7 +4,7 @@ vendored aws-samples/sample-genai-on-eks Terraform.
 
 WHY
 ---
-Measured live on 2026-09-04 (DIAGNOSTICS9.md). Six minutes into a ~16GB
+Measured live on 2026-09-04 (DIAGNOSTICS9.md). Six minutes into a 9.7GB
 HuggingFace pull, Karpenter consolidated the node out from under it:
 
     DisruptionTerminating  node/i-<redacted>         Disrupting Node: Underutilized

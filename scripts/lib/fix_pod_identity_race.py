@@ -16,8 +16,8 @@ and its validator said:
     ERROR: Pod Identity not working. Using node role instead of Pod Identity role.
     Pod will be recreated to retry Pod Identity association.
 
-The pod was NOT recreated. It ran for another 40 minutes and would have failed at
-the very end, after downloading ~16GB.
+The pod was NOT recreated. It kept running and could only have failed at the very
+end, after downloading 9.7GB (measured at 11m09s once left alone).
 
 THE RACE (which is NOT a missing depends_on)
 --------------------------------------------
@@ -46,8 +46,8 @@ Upstream anticipated exactly this -- hence "Pod will be recreated to retry Pod
 Identity association" and `backoffLimit: 10`. But `validate-pod-identity` is a
 SIBLING container of `download` under `restartPolicy: Never`. A Job only creates
 a replacement pod once the current pod FAILS, and a pod only fails when ALL of
-its containers terminate. `download` keeps running for the length of a ~16GB
-HuggingFace pull, so the pod stays Running, the Job never retries, and
+its containers terminate. `download` keeps running for the length of a 9.7GB
+HuggingFace pull (measured: 11m09s), so the pod stays Running, the Job never retries, and
 `backoffLimit: 10` is dead code. The validator detects the fault correctly and
 is structurally unable to act on it.
 
@@ -56,7 +56,7 @@ THE FIX
 Move the validator to `initContainers`. Two things then work:
 
   1. It GATES the download instead of racing beside it -- a pod with no
-     credentials burns ~3 seconds, not ~40 minutes of bandwidth.
+     credentials burns ~3 seconds, not 11 minutes of bandwidth.
   2. Its exit 1 fails the POD, so the Job's existing backoffLimit: 10 finally
      does what it was written to do. Job backoff is 10s, 20s, 40s... which is
      orders of magnitude more than the propagation window needs, and stays well

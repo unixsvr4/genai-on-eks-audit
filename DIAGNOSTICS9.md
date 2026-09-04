@@ -22,8 +22,8 @@ behind that blocker the whole time, in one resource: `kubectl_manifest
 tag `v2.5.2`, all three were invisible until a run got far enough to hit them,
 and all three are now patched at clone time.
 
-**Why none of them announced itself:** for the entire ~40 minutes all of this was
-going wrong, the cluster reported
+**Why none of them announced itself:** for the entire 31 minutes all of this was
+going wrong (job created 14:46:23, completed 15:17), the cluster reported
 
 ```console
 $ kubectl get job -n default model-download
@@ -127,13 +127,13 @@ Identity association` and `backoffLimit: 10` are for. The pod was never recreate
           restartPolicy: Never
           containers:
             - name: validate-pod-identity   # exits 1 on failure
-            - name: download                # runs for ~40 minutes
+            - name: download                # runs for 11+ minutes
 ```
 
 `validate-pod-identity` is a **sibling** of `download`, not an initContainer. A
 Job creates a replacement pod only once the current pod *fails*, and a pod fails
 only when **all** of its containers terminate. `download` keeps running for the
-length of a ~16GB HuggingFace pull, so the pod stays `Running` indefinitely, the
+length of a 9.7GB HuggingFace pull (measured: 11m09s), so the pod stays `Running`, the
 Job never retries, and `backoffLimit: 10` is dead code.
 
 The validator diagnoses the fault correctly, prints the correct remedy, and
@@ -149,15 +149,15 @@ Total Objects: 1
 ```
 
 Bug 2 is the more serious of the two. Bug 1 alone is a ~140ms race with a working
-recovery path. Bug 2 is what converts it into a guaranteed 40-minute silent
-failure.
+recovery path. Bug 2 is what converts it into a guaranteed silent failure that
+only surfaces at the upload, 11 minutes of bandwidth later.
 
 ### Fix
 
 Move the validator to `initContainers`. Two things then work:
 
 1. It **gates** the download instead of racing beside it, so a pod with no
-   credentials costs ~3 seconds rather than ~40 minutes of bandwidth.
+   credentials costs ~3 seconds rather than 11 minutes of bandwidth.
 2. Its `exit 1` fails the **pod**, so the existing `backoffLimit: 10` finally
    does what it was written to do. Job backoff is 10s, 20s, 40s… — orders of
    magnitude more than the propagation window needs, and well inside
@@ -193,7 +193,7 @@ $ kubectl get events -n default --sort-by=.lastTimestamp
 96s  Normal  SuccessfulCreate       job/model-download        Created pod: model-download-d79px
 ```
 
-Karpenter consolidated the node out from under an in-flight 16GB download, six
+Karpenter consolidated the node out from under an in-flight 9.7GB download, six
 minutes in, to save **$0.20/hr**.
 
 ### Root cause

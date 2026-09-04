@@ -123,7 +123,7 @@ if [ -z "$(aws eks list-pod-identity-associations --cluster-name "$CLUSTER_NAME"
     || die "Could not create the pod identity association for s3-access-sa."
 fi
 # Pod Identity is injected at pod ADMISSION and the association is not instantly
-# visible to that webhook -- the same race that cost a 16GB download in
+# visible to that webhook -- the same race that cost a 9.7GB download in
 # DIAGNOSTICS9.md bug 1. The Job below is created seconds later, so wait it out.
 log "Waiting for the pod identity association to become visible to the admission webhook..."
 sleep 15

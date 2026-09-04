@@ -40,16 +40,16 @@ python3 "${REPO_ROOT}/scripts/lib/fix_destroy_order.py" "${TARGET}/terraform" \
 # returns before the association is visible to the admission webhook -- measured
 # at a 141ms overlap on a real run -- so the pod is admitted with no credentials
 # and cannot recover. Upstream's own retry (backoffLimit: 10) cannot fire because
-# the validator is a sibling of a container that keeps running for a ~16GB
+# the validator is a sibling of a container that keeps running for a 9.7GB
 # download. Moving the validator to initContainers makes that retry work. This is
 # NOT a depends_on problem: upstream already has the edge and still loses the
 # race. See scripts/lib/fix_pod_identity_race.py and DIAGNOSTICS9.md.
 log "Applying the Pod Identity race fix to the clone..."
 python3 "${REPO_ROOT}/scripts/lib/fix_pod_identity_race.py" "${TARGET}/terraform" \
-  || die "Could not apply the Pod Identity race fix -- upstream @ ${TERRAFORM_TAG} no longer matches what scripts/lib/fix_pod_identity_race.py expects (see above). Reconcile it before deploying, or the model-download Job can burn a ~16GB download and fail at the upload (DIAGNOSTICS9.md)."
+  || die "Could not apply the Pod Identity race fix -- upstream @ ${TERRAFORM_TAG} no longer matches what scripts/lib/fix_pod_identity_race.py expects (see above). Reconcile it before deploying, or the model-download Job can burn a 9.7GB download and fail at the upload (DIAGNOSTICS9.md)."
 
 # --- Karpenter consolidation vs. the model download ---------------------------
-# The model-download Job writes a ~16GB model to the container's ephemeral
+# The model-download Job writes a 9.7GB model to the container's ephemeral
 # filesystem (the pod template mounts nothing), so an eviction destroys all
 # progress and the replacement pod restarts from zero. Karpenter consolidated the
 # node out from under it after six minutes to save $0.20/hr, and would keep doing
