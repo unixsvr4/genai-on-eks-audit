@@ -1163,3 +1163,79 @@ mattered rather than merely helped. Under the old `sleep 3`, this step would hav
 been tested about 60 seconds before vLLM finished loading base model + adapter,
 failed, and been recorded as the documented LoRA problem recurring — closing a
 genuine open question with a fabricated answer.
+
+
+---
+
+## Postscript 9 — `10-rag.sh` warned twice, then failed three steps later
+
+```console
+[12:40:51] make_bucket: rag-workshop-data-<redacted>-us-east-2
+[12:40:52] WARNING: Sample dataset not found in the vendored repo at the expected path
+[12:40:52] WARNING: rag-document-processor Job not found — apply it from your Terraform clone
+[12:40:52] Verifying vectors landed in S3 Vectors...
+aws: [ERROR]: An error occurred (NotFoundException) when calling the QueryVectors
+operation: The specified index could not be found
+```
+
+The `NotFoundException` is not the bug. It is the **consequence** of the two
+warnings above it: no dataset was uploaded, so no ingestion ran, so no index was
+ever created. The script diagnosed its own failure twice, in order, and then
+carried on to a step that could not possibly succeed — the same
+warn-and-continue shape as the FREE-plan gate in `DIAGNOSTICS8.md`.
+
+### What was actually missing
+
+Nothing this module needs existed in a fresh account:
+
+```console
+$ kubectl get sa s3-access-sa                        → NotFound
+$ aws iam get-role --role-name rag-document-processor-role → NoSuchEntity
+$ aws iam list-policies … RagS3ReadPolicy            → (empty)
+$ aws eks list-pod-identity-associations … s3-access-sa → (empty)
+$ aws s3vectors list-vector-buckets                  → (empty)
+```
+
+and the processor script creates none of them — no `create_vector_bucket`, no
+`create_index`. The script's own NOTE half-admitted this ("this repo doesn't
+script the RagS3ReadPolicy/rag-document-processor-role creation in detail") and
+pointed at RESEARCH.md for the Job spec. **RESEARCH.md does not have it.** Line
+955 records that the Job "was in the part of the log that scrolled off" — the
+pointer was to a spec that was never captured.
+
+Two upstream quirks compounded it:
+
+- The dataset ships as `manifests/300-rag/eletronics.jsonl` — **missing a `c`**,
+  and with no `samples/` subdirectory. The script looked for
+  `300-rag/samples/electronics.jsonl`, which matches neither, so the upload
+  `|| warn`ed and the bucket stayed empty.
+- `rag-processor.yml` is a **ConfigMap only**. There is no Job in it. Upstream
+  ships the script and expects you to bring the Job.
+
+### Fix
+
+`10-rag.sh` now provisions everything and fails loudly instead of warning:
+
+- resolves the dataset across all three plausible names (so a fixed upstream
+  keeps working) and `die`s if none is found, rather than uploading nothing
+- creates the S3 Vectors bucket and a 384-dim `cosine` index — matching
+  `all-MiniLM-L6-v2` — and verifies with `get-index`
+- creates `RagS3ReadPolicy` scoped to exactly the two buckets,
+  `rag-document-processor-role` trusting `pods.eks.amazonaws.com` with
+  `sts:AssumeRole` + `sts:TagSession`, the `s3-access-sa` ServiceAccount, and the
+  pod identity association
+- waits after creating that association before creating the Job, because Pod
+  Identity is injected at pod **admission** and the association is not instantly
+  visible to the webhook — bug 1 in this same document, avoided by construction
+- authors the missing Job from the versions the capture *did* preserve
+  (`torch 2.13.0+cpu`, `sentence-transformers 5.6.0`, `all-MiniLM-L6-v2`,
+  384-dim), with a fallback if that torch pin no longer resolves
+- polls for success or failure and `die`s on either failure or timeout, so the
+  `query-vectors` step is only ever reached when there is something to query
+
+The vector bucket, index, policy, role, association and ConfigMap are all already
+deleted by `99-destroy-all.sh`, so the teardown surface does not grow.
+
+Validated: the Job passes server-side dry-run against the live API server, and
+`aws s3vectors get-index` exists (a `die` on a nonexistent subcommand would have
+made the script unconditionally fail).
