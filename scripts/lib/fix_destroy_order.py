@@ -51,6 +51,30 @@ import sys
 
 ADDED = "module.vpc"
 
+# A second, INDEPENDENT destroy race, measured 2026-09-04 on the first real
+# teardown (DIAGNOSTICS9.md, Postscript 10). The module.vpc edges above worked --
+# no VPC resource was destroyed alongside the namespace this time -- but the run
+# still ended in `context deadline exceeded`, from a different cause:
+#
+#   kubectl_manifest.karpenter_node_pool_gpu: Still destroying... [05m38s elapsed]
+#   kubernetes_namespace_v1.monitoring:       Still destroying... [04m50s elapsed]
+#   Error: context deadline exceeded
+#
+# Deleting the GPU NodePool drains and terminates its node. kube-prometheus-stack
+# runs node-exporter as a DaemonSet, so there is a pod on that node, and a pod
+# whose node disappears mid-termination can sit in Terminating indefinitely --
+# observed at 103 minutes. The namespace cannot finalize while any pod remains,
+# so it blew Terraform's 5-minute delete timeout.
+#
+# Fix: destroy the namespace BEFORE the NodePool, so its DaemonSet pods terminate
+# on live nodes. Terraform destroys in reverse dependency order, so "namespace
+# first" means the namespace must DEPEND ON the nodepool. Acyclic: the nodepool
+# depends only on module.eks.
+EXTRA = {
+    ("kubernetes_namespace_v1", "monitoring"):
+        ["kubectl_manifest.karpenter_node_pool_gpu"],
+}
+
 # resource address -> the exact depends_on we expect upstream to have.
 ROOTS = {
     ("kubernetes_namespace_v1", "monitoring"):
@@ -105,7 +129,8 @@ def main():
             continue
         deps = [p.strip() for p in d.group(1).split(",") if p.strip()]
 
-        if ADDED in deps:
+        wanted = [ADDED] + EXTRA.get((kind, name), [])
+        if all(w in deps for w in wanted):
             already.append(label)
             continue
         if deps != expected:
@@ -116,10 +141,10 @@ def main():
             )
             continue
 
-        new_list = "depends_on = [\n    " + ",\n    ".join(deps + [ADDED]) + ",\n  ]"
+        new_list = "depends_on = [\n    " + ",\n    ".join(deps + wanted) + ",\n  ]"
         new_body = body[:d.start()] + new_list + body[d.end():]
         open(path, "w").write(text[:bs] + new_body + text[be:])
-        patched.append(f"{label} ({os.path.basename(path)})")
+        patched.append(f"{label} ({os.path.basename(path)}) += {', '.join(wanted)}")
 
     if problems:
         print("Destroy-order patch does not match upstream:", file=sys.stderr)
@@ -129,7 +154,7 @@ def main():
         return 1
 
     for p in patched:
-        print(f"  + {ADDED} -> {p}")
+        print(f"  + {p}")
     if already:
         print(f"  ({len(already)} already patched)")
     return 0

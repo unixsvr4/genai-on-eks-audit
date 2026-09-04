@@ -111,6 +111,37 @@ else
   log "No active ODCR found."
 fi
 
+# --- Unstick pods whose node disappeared ---------------------------------------
+# A pod on a node that is terminated mid-deletion can sit in Terminating forever:
+# the kubelet is gone, so it never acknowledges, and nothing else will. Measured
+# 2026-09-04: a kube-prometheus-stack node-exporter pod sat at 103 minutes and
+# blocked `kubernetes_namespace_v1.monitoring` from finalizing, which blew
+# Terraform's 5-minute delete timeout and ended the destroy with the generic
+# `Error: context deadline exceeded`.
+#
+# The dependency edge added by scripts/lib/fix_destroy_order.py prevents this by
+# destroying the namespace before the NodePool. This sweep is the backstop for a
+# cluster that is ALREADY wedged -- e.g. re-running after a failed destroy. It only
+# touches pods that have a deletionTimestamp, i.e. ones Kubernetes has already been
+# told to delete, so it cannot kill anything that was meant to keep running.
+STUCK=$(kubectl get pods -A -o json 2>/dev/null | python3 -c '
+import json,sys
+try: pods=json.load(sys.stdin).get("items",[])
+except Exception: sys.exit(0)
+for p in pods:
+    m=p["metadata"]
+    if m.get("deletionTimestamp"):
+        print(m["namespace"], m["name"])
+' 2>/dev/null || echo "")
+if [ -n "$STUCK" ]; then
+  warn "Pods stuck in Terminating (their node is likely gone) — force-deleting so namespaces can finalize:"
+  echo "$STUCK" | while read -r ns name; do
+    [ -z "$name" ] && continue
+    warn "  ${ns}/${name}"
+    kubectl delete pod -n "$ns" "$name" --force --grace-period=0 2>/dev/null || true
+  done
+fi
+
 log "=== Base infrastructure (terraform destroy) ==="
 TF_DIR="${DEPLOY_DIR}/sample-genai-on-eks/terraform"
 if [ -d "$TF_DIR" ]; then

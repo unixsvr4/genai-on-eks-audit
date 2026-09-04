@@ -1271,3 +1271,91 @@ The ALB hostname also printed correctly rather than `http://pending` — the
 $ curl -o /dev/null -w "HTTP %{http_code}" http://rag-gradio-alb-<id>.us-east-2.elb.amazonaws.com/
 HTTP 200
 ```
+
+
+---
+
+## Postscript 10 — first real teardown: the ordering fix worked, and exposed a second race
+
+The `module.vpc` edges from `DIAGNOSTICS8.md` had never been exercised against a
+live destroy. They were, and they held: **no VPC resource was destroyed alongside
+the Kubernetes layer.** No NAT gateway, subnet or IGW appears anywhere in the
+destroy log before the failure, and afterwards `nat-<id>` was still present —
+exactly the intended behaviour, and the opposite of round 8.
+
+The destroy still failed, with the same *message* and a different *cause*:
+
+```console
+kubectl_manifest.karpenter_node_pool_gpu: Still destroying... [05m38s elapsed]
+kubernetes_namespace_v1.monitoring:       Still destroying... [04m50s elapsed]
+╷
+│ Error: context deadline exceeded
+╵
+```
+
+Note both were destroying **concurrently**, and the nodepool took 5m38s while the
+namespace timed out at 5m.
+
+### Root cause
+
+```console
+$ kubectl get ns monitoring -o json | jq .status.conditions
+NamespaceDeletionContentFailure: True
+  "unexpected items still remain in namespace: monitoring for gvr: /v1, Resource=pods"
+
+$ kubectl get pods -n monitoring
+kube-prometheus-stack-prometheus-node-exporter-hd6v8   1/1   Terminating   103m
+```
+
+Deleting the GPU NodePool drains and terminates its node. kube-prometheus-stack
+runs node-exporter as a **DaemonSet**, so there is one of its pods on every node
+— including the one being destroyed. A pod whose node disappears mid-termination
+has nothing left to acknowledge the delete: the kubelet is gone. It sat in
+`Terminating` for **103 minutes**. A namespace cannot finalize while any pod
+remains, so it blew Terraform's 5-minute delete timeout.
+
+This is a genuinely different race from round 8. That one was Kubernetes-layer
+versus *VPC*; this is Kubernetes-layer versus *its own compute*. The first fix
+could not have prevented it, and finding it required the first fix to work.
+
+### Fix
+
+Destroy the namespace **before** the NodePool, so its DaemonSet pods terminate on
+live nodes that can acknowledge it. Terraform destroys in reverse dependency
+order, so "namespace first" means the namespace must **depend on** the nodepool:
+
+```hcl
+resource "kubernetes_namespace_v1" "monitoring" {
+  depends_on = [
+    module.eks,
+    module.eks.cluster_addons,
+    module.vpc,
+    kubectl_manifest.karpenter_node_pool_gpu,
+  ]
+}
+```
+
+Acyclic — the nodepool depends only on `module.eks`. `fix_destroy_order.py` grew
+an `EXTRA` map for per-resource additions beyond the blanket `module.vpc`, and
+still asserts the exact upstream `depends_on` before touching anything.
+
+Verified on pristine `v2.5.2`: applies cleanly, is idempotent, and
+`terraform validate` returns **Success** — which is the check that matters, since
+the failure mode of a wrong-direction edge is a dependency cycle.
+
+`99-destroy-all.sh` also gained a backstop for a cluster that is *already* wedged
+(re-running after a failed destroy): it force-deletes pods carrying a
+`deletionTimestamp` before `terraform destroy`. Scoped to pods Kubernetes has
+already been told to delete, so it cannot kill anything meant to be running.
+
+### Status
+
+The namespace unblocked on its own once the orphaned pod's node object was
+removed — `NamespaceContentRemaining: False`, `NamespaceFinalizersRemaining:
+False`, with only a stale `ContentFailure` condition left over. Re-running
+`99-destroy-all.sh` completes the teardown; `terraform destroy` is idempotent and
+the ALBs had already gone.
+
+Two fixes now stand proven-then-superseded in the same way: each teardown has
+found the next ordering problem behind the one it fixed. This one is again
+verified statically and **not** yet exercised on a live destroy.
