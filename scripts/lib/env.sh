@@ -164,3 +164,78 @@ free_tier_check() {
     *)       return 2 ;;
   esac
 }
+
+# --- Readiness helpers --------------------------------------------------------
+# Both of these exist because several scripts used a fixed `sleep 3` (or a flag
+# that does not exist) in place of an actual readiness check, and then reported a
+# timing problem as an infrastructure failure. See DIAGNOSTICS9.md.
+
+# Wait for an Ingress to be given its load-balancer hostname.
+#
+# ALB provisioning is asynchronous: the AWS Load Balancer Controller has to see
+# the Ingress, create the ALB, and write the hostname back into
+# .status.loadBalancer.ingress[0].hostname. Measured live 2026-09-04: 39s. Reading
+# it immediately after `kubectl apply` always yields an empty string.
+#
+# NOTE: `kubectl get --timeout=120s` does NOT do this. `--timeout` is not a valid
+# flag for `kubectl get` at all ("error: unknown flag: --timeout"), so that idiom
+# fails instantly and, with 2>/dev/null || echo "pending", silently prints
+# "pending" forever -- which is exactly the bug this replaces.
+#
+# Usage: lb_hostname <ingress-name> [extra kubectl args, e.g. -n monitoring]
+# Echoes the hostname and returns 0, or echoes nothing and returns 1 on timeout.
+lb_hostname() {
+  local name="$1"; shift
+  local deadline=$(( $(date +%s) + ${LB_TIMEOUT:-300} ))
+  local h=""
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    # AWS ALBs publish .hostname; GKE/AKS publish .ip. Take whichever exists so
+    # this helper stays valid when gcloud/ and azure/ grow their own scripts.
+    h=$(kubectl get ingress "$name" "$@" \
+      -o jsonpath='{.status.loadBalancer.ingress[0].hostname}{.status.loadBalancer.ingress[0].ip}' \
+      2>/dev/null || echo "")
+    if [ -n "$h" ]; then echo "$h"; return 0; fi
+    sleep 5
+  done
+  return 1
+}
+
+# Start a port-forward and block until the far end actually answers HTTP.
+#
+# `kubectl wait --for=jsonpath='{.status.phase}'=Running` only proves the
+# container process started. A server that then loads a model (vLLM: 9.7GB from
+# S3 onto the GPU, measured at 69s) is not listening yet, and the port-forward
+# reports that as what looks like a CNI fault:
+#     failed to connect to localhost:8000 inside namespace "..."
+#     connect: connection refused / error: lost connection to pod
+# kubectl port-forward EXITS in that case, so this restarts it rather than
+# holding a dead PID.
+#
+# Any HTTP response counts as ready -- a 404 still proves something is listening,
+# and not every service has a /health.
+#
+# Usage: pf_start <svc/name> <localport>:<remoteport> [path]
+# Sets PF_PID on success. Returns 1 on timeout (PF_PID left empty).
+pf_start() {
+  local target="$1" ports="$2" path="${3:-/}"
+  local lport="${ports%%:*}"
+  local deadline=$(( $(date +%s) + ${PF_TIMEOUT:-300} ))
+  PF_PID=""
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    kubectl port-forward "$target" "$ports" >/dev/null 2>&1 &
+    PF_PID=$!
+    local inner=$(( $(date +%s) + 15 ))
+    while [ "$(date +%s)" -lt "$inner" ]; do
+      kill -0 "$PF_PID" 2>/dev/null || break   # forward died: server not up yet
+      if curl -s -o /dev/null --max-time 2 "http://localhost:${lport}${path}" 2>/dev/null; then
+        return 0
+      fi
+      sleep 2
+    done
+    kill "$PF_PID" 2>/dev/null || true
+    wait "$PF_PID" 2>/dev/null || true
+    PF_PID=""
+    sleep 2
+  done
+  return 1
+}

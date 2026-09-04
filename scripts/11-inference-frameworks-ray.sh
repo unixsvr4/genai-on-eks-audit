@@ -54,7 +54,9 @@ curl -sf -o "${MANIFEST_DIR}/400-ray/openwebui.yml" \
 kubectl apply -f "${MANIFEST_DIR}/400-ray/openwebui.yml"
 kubectl wait --for=condition=ready pod -l app=open-webui --timeout=300s
 
-OPENWEBUI_URL=$(kubectl get ingress open-webui-ingress -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "pending")
+log "Waiting for the Open WebUI ALB hostname..."
+OPENWEBUI_URL=$(lb_hostname open-webui-ingress) \
+  || { warn "ALB hostname did not appear within ${LB_TIMEOUT:-300}s. Check: kubectl describe ingress open-webui-ingress"; OPENWEBUI_URL="pending"; }
 log "Open WebUI (Ray-backed): http://${OPENWEBUI_URL}"
 
 log "Wiring up Ray-specific Prometheus PodMonitors..."

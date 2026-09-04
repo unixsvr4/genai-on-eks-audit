@@ -68,9 +68,13 @@ envsubst < "${MANIFEST_DIR}/600-strands-agent/vllm-deployment-agents.yaml" | kub
 kubectl wait pods --for=jsonpath='{.status.phase}'=Running -l app=strands-weather-agent --timeout=300s
 
 log "Testing tool-calling end to end..."
-kubectl port-forward svc/strands-weather-agent 8080:80 &
-PF_PID=$!
-sleep 3
+# `phase == Running` above only means the container started; the agent's own HTTP
+# server binds later, and it in turn calls vLLM. A fixed `sleep 3` here produced
+# the same misleading "connection refused inside namespace" failure that
+# 03-serve-model.sh hit (DIAGNOSTICS9.md) -- so wait for the port to actually
+# answer instead.
+pf_start svc/strands-weather-agent 8080:80 \
+  || die "The strands agent never answered on :8080. Check: kubectl logs -l app=strands-weather-agent"
 curl -s -X POST http://localhost:8080/agent -H "Content-Type: application/json" \
   -d '{"query": "What time is it in Dallas?"}' | jq -r '.response.message.content[0].text'
 curl -s -X POST http://localhost:8080/agent -H "Content-Type: application/json" \

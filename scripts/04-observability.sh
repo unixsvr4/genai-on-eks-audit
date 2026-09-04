@@ -76,7 +76,12 @@ spec:
 EOF
 kubectl apply -f "${MANIFEST_DIR}/300-observability/grafana-ingress.yaml"
 
-GRAFANA_URL=$(kubectl get ingress/grafana-ingress -n monitoring -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' --timeout=120s 2>/dev/null || echo "pending")
+# `kubectl get --timeout=120s` is not a real flag -- it errors with "unknown
+# flag", 2>/dev/null swallowed that, and this printed "pending" on EVERY run
+# regardless of the ALB. lb_hostname actually polls. Measured: 39s to appear.
+log "Waiting for the ALB to be provisioned and its hostname published..."
+GRAFANA_URL=$(lb_hostname grafana-ingress -n monitoring) \
+  || { warn "ALB hostname did not appear within ${LB_TIMEOUT:-300}s. Check: kubectl describe ingress grafana-ingress -n monitoring"; GRAFANA_URL="pending"; }
 GRAFANA_PASSWORD=$(kubectl get secret -n monitoring kube-prometheus-stack-grafana -o jsonpath="{.data.admin-password}" | base64 --decode)
 log "Grafana: http://${GRAFANA_URL}  (user: admin / password: ${GRAFANA_PASSWORD})"
 warn "Change this password if this deployment outlives the demo window — it's a chart default, not randomly generated."

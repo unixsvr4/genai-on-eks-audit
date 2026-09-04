@@ -75,6 +75,8 @@ curl -sf -o "${MANIFEST_DIR}/500-rag/rag-gradio-deploy.yml" \
 kubectl apply -f "${MANIFEST_DIR}/500-rag/rag-gradio-deploy.yml"
 kubectl wait pods --for=jsonpath='{.status.phase}'=Running -l app=rag-gradio-interface --timeout=300s
 
-GRADIO_URL=$(kubectl get ingress rag-gradio-alb -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "pending")
+log "Waiting for the Gradio ALB hostname..."
+GRADIO_URL=$(lb_hostname rag-gradio-alb) \
+  || { warn "ALB hostname did not appear within ${LB_TIMEOUT:-300}s. Check: kubectl describe ingress rag-gradio-alb"; GRADIO_URL="pending"; }
 log "RAG Gradio UI: http://${GRADIO_URL}/?__theme=dark"
 log "Next: ./11-inference-frameworks-ray.sh"

@@ -61,9 +61,13 @@ if ! kubectl wait --for=jsonpath='{.status.phase}'=Running pod -l model=anyvc --
   warn "Continuing to the next module rather than blocking — this matches the honest outcome"
   warn "documented in RESEARCH.md; the fine-tune itself already succeeded above."
 else
-  kubectl port-forward svc/vllm-serve-svc 8000:8000 &
-  PF_PID=$!
-  sleep 3
+  # This vLLM has to load the base model AND the LoRA adapter before it binds
+  # :8000 -- strictly slower than the 69s measured in 03-serve-model.sh. A fixed
+  # `sleep 3` here was especially bad: this script documents LoRA SERVING as a
+  # known-risk step, so a purely-timing failure would be misread as the real
+  # LoRA problem. Wait for /health, then ask.
+  pf_start svc/vllm-serve-svc 8000:8000 /health \
+    || die "The LoRA-serving vLLM never answered on :8000. This IS the failure mode this script warns about -- check: kubectl logs -l model=anyvc"
   curl -s http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" -d '{
     "model": "anyvc-startup-expert",
     "messages": [{"role": "user", "content": "We are building TalentPulse, an AI recruiting platform for nurses. 40 nurses placed across 8 hospitals in 3 months, $200K revenue."}],

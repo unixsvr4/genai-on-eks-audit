@@ -594,3 +594,101 @@ usage: {'prompt_tokens': 8, 'total_tokens': 15, 'completion_tokens': 7}
 
 Ministral-3-8B, streamed from S3 by the Run:ai Streamer at `concurrency: 16`,
 serving from the on-demand L40S that AWS would not reserve.
+
+---
+
+## Postscript 3 — reading ahead: the same defect in four more places
+
+After 03, the remaining scripts were read looking for the shape rather than
+waiting to hit each one at runtime: **a hardcoded assumption standing in for a
+real check.** Four more instances, one of which is worse than a race.
+
+### 04 — the Grafana URL was never going to work
+
+```console
+[11:39:08] Grafana: http://pending
+```
+
+```bash
+GRAFANA_URL=$(kubectl get ingress/grafana-ingress -n monitoring \
+  -o jsonpath='...' --timeout=120s 2>/dev/null || echo "pending")
+```
+
+`--timeout` **is not a valid flag for `kubectl get`**:
+
+```console
+$ kubectl get ingress grafana-ingress -n monitoring --timeout=5s
+error: unknown flag: --timeout
+```
+
+So the command failed instantly, `2>/dev/null` hid the reason, and `|| echo
+"pending"` supplied a plausible-looking answer. This was not a race that
+sometimes lost — it printed `pending` on **every** run, and would have done so if
+the ALB had been ready for an hour. The `--timeout=120s` reads as deliberate
+patience and bought nothing.
+
+The ALB was in fact fine. Hostname 39 seconds after the Ingress was created:
+
+```console
+$ kubectl get ingress grafana-ingress -n monitoring -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+grafana-ingress-1443646815.us-east-2.elb.amazonaws.com
+```
+
+### 05 and 09 — the 03 bug, verbatim
+
+Both carried the identical `phase == Running` + `sleep 3` + `curl` sequence.
+
+`09` is the one that matters. Its vLLM must load the base model **and** the LoRA
+adapter, so it is strictly slower than the 69s measured in 03 — and the script's
+own header documents LoRA *serving* as a known-risk step that has failed before.
+A purely-timing failure there would have been read as the real LoRA problem and
+written up as such. A three-second sleep was positioned to manufacture false
+evidence for an existing open question.
+
+### 10 and 11 — the ALB race, correctly spelled
+
+Both read `.status.loadBalancer.ingress[0].hostname` immediately after `kubectl
+apply`, with `|| echo "pending"`. Unlike 04 the syntax is valid, so these are
+genuine races — and ones they lose, since the hostname takes ~40s to appear.
+
+### Fix: two shared helpers in `scripts/lib/env.sh`
+
+Kept in `lib/` rather than fixed per-script, for the same reason
+`free_tier_check()` lives there: five copies of a readiness check drift, and the
+drift is invisible until a run fails.
+
+- **`lb_hostname <ingress> [-n ns]`** — polls until the load balancer publishes
+  an address, up to `LB_TIMEOUT` (default 300s). Reads `.hostname` *and* `.ip`, so
+  it stays correct for `gcloud/` and `azure/` (GKE/AKS publish `.ip`).
+- **`pf_start <svc> <local:remote> [path]`** — starts a port-forward and blocks
+  until the far end actually answers HTTP, setting `PF_PID`. It **restarts** the
+  forward rather than holding a dead PID, because `kubectl port-forward` *exits*
+  when the server is not listening yet — that is what produced `error: lost
+  connection to pod` in 03. Any HTTP status counts as ready: a 404 still proves
+  something is listening, and not every service has `/health`.
+
+Both were verified against the live cluster:
+
+| check | result |
+|---|---|
+| `lb_hostname` on the provisioned Grafana ingress | 1s, correct hostname |
+| `lb_hostname` on a nonexistent ingress, `LB_TIMEOUT=8` | returns 1, empty, gives up on time |
+| `pf_start svc/vllm-serve-svc 18000:8000 /health` | 2s, `HTTP 200` through the forward |
+| `pf_start` at a port with nothing listening, `PF_TIMEOUT=20` | returns 1 at 20s, `PF_PID` empty, **no leaked port-forward processes** |
+
+The helper block is byte-identical across `aws/`, `azure/` and `gcloud/`
+(md5 `0ce6c7b1…`), since divergence between those three copies is how an earlier
+masking bug survived.
+
+### The pattern
+
+Five scripts, one defect: `us-east-2a` for "the region", `sleep 3` for "the server
+is up", a sibling container for a gate, `--timeout=120s` for "wait", `phase ==
+Running` for "ready". Each was true on the machine it was written on and wrong the
+first time reality varied. Every fix in this round replaces a guess with an
+observation — poll the endpoint, ask the API, intersect the real sets.
+
+The 04 case is the one worth remembering, because it did not fail. It printed a
+confident, wrong answer for the entire life of the repo, and only a read-through
+found it. `2>/dev/null || echo "<plausible default>"` is how a broken command
+becomes indistinguishable from a working one.
