@@ -24,34 +24,165 @@ unzip -o "${MANIFEST_DIR}/600-strands-agent/strands.zip" -d "${MANIFEST_DIR}/600
 # Check the daemon BEFORE the ECR login. `docker login` succeeds without a daemon
 # (it just writes a credential), so without this the run prints "Login Succeeded"
 # and then dies on the build -- which reads as an ECR/auth problem and is not one.
-set +e
-docker_daemon_check
-DOCKER_RC=$?
-set -e
-if [ "$DOCKER_RC" -ne 0 ]; then
-  warn "This script has to build an image, and 'docker info' failed."
-  while IFS= read -r line; do warn "$line"; done <<< "$(docker_daemon_advice)"
-  die "Docker is not usable. Nothing has been created."
-fi
-
-log "Building + pushing to ECR..."
+# --- Image build --------------------------------------------------------------
+# DEFAULT: build IN-CLUSTER, on an amd64 node this cluster is already running.
+#
+# The local-docker path produced three of this module's four failures on
+# 2026-09-04 (DIAGNOSTICS9.md), none of which were AWS problems:
+#   1. the Docker daemon was not running, and `docker login` succeeded anyway,
+#      so the run reported success one line before it failed
+#   2. the daemon WAS running, but the docker context pointed at a socket that
+#      did not exist
+#   3. the image was built for the build host (arm64 Apple Silicon) and died on
+#      an amd64 node with "exec format error"
+# All three are properties of the laptop, not of the workshop. Building where the
+# image will actually run removes the whole class: no daemon to be down, no
+# context to be wrong, and the build architecture IS the run architecture.
+#
+# It also costs nothing extra and creates no AWS resources -- it runs on capacity
+# already provisioned, and everything it makes is a Kubernetes object that dies
+# with the cluster. That matters here: teardown has been the repo's most
+# expensive recurring problem, and CodeBuild would have added an IAM role, a
+# build project and an S3 source upload to it, for one 3.6KB build context.
+#
+# ECR push credentials come from `aws ecr get-login-password` -- a 12h token in a
+# Secret that is deleted as soon as the build finishes. No IAM role, no pod
+# identity association, no change to the vendored Terraform.
+#
+# Set USE_LOCAL_DOCKER=1 to take the upstream-faithful local path instead. The
+# published workshop builds locally; this is a deliberate, documented deviation.
+log "Preparing ECR repository..."
 aws ecr describe-repositories --repository-names strands-weather-agent >/dev/null 2>&1 \
   || aws ecr create-repository --repository-name strands-weather-agent >/dev/null
 ECR_REPO=$(aws ecr describe-repositories --repository-names strands-weather-agent --query 'repositories[0].repositoryUri' --output text)
 export ECR_REPO
-aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$(echo "$ECR_REPO" | cut -d'/' -f1)"
-# --platform is REQUIRED, not cosmetic. `docker build` with no platform builds for
-# the BUILD HOST, and on Apple Silicon that is arm64 -- which lands on an amd64 EKS
-# node and dies with a message that says nothing about architecture:
-#     exec /usr/local/bin/python: exec format error
-# The cluster is mixed (EKS Auto Mode ran c6g.large/arm64 for system and
-# c6a.large/amd64 for general-purpose), so "whatever the host is" is wrong even by
-# accident. Pin the image to amd64 here and pin the POD to amd64 below, so the two
-# cannot disagree.
-log "Building for linux/amd64 (build host is $(uname -m); EKS Auto Mode's general-purpose nodes are amd64)..."
-docker build --platform linux/amd64 -t strands-weather-agent "${MANIFEST_DIR}/600-strands-agent"
-docker tag strands-weather-agent:latest "${ECR_REPO}:latest"
-docker push "${ECR_REPO}:latest"
+ECR_REGISTRY="${ECR_REPO%%/*}"
+BUILD_CTX="${MANIFEST_DIR}/600-strands-agent"
+
+if [ "${USE_LOCAL_DOCKER:-0}" = "1" ]; then
+  # ---- Local Docker (upstream's path; opt-in) --------------------------------
+  warn "USE_LOCAL_DOCKER=1 -- building on this machine instead of in-cluster."
+  set +e
+  docker_daemon_check
+  DOCKER_RC=$?
+  set -e
+  if [ "$DOCKER_RC" -ne 0 ]; then
+    warn "This script has to build an image, and 'docker info' failed."
+    while IFS= read -r line; do warn "$line"; done <<< "$(docker_daemon_advice)"
+    die "Docker is not usable. Nothing has been created."
+  fi
+  aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+  # --platform is REQUIRED, not cosmetic -- see the note above. The cluster is
+  # mixed (c6g.large/arm64 for system, c6a.large/amd64 for general-purpose), so
+  # "whatever the host is" is wrong even by accident.
+  log "Building for linux/amd64 (build host is $(uname -m))..."
+  docker build --platform linux/amd64 -t strands-weather-agent "$BUILD_CTX"
+  docker tag strands-weather-agent:latest "${ECR_REPO}:latest"
+  docker push "${ECR_REPO}:latest"
+else
+  # ---- In-cluster build (default) --------------------------------------------
+  log "Building in-cluster on an amd64 node (no local Docker; set USE_LOCAL_DOCKER=1 to build here instead)..."
+
+  # The build context is ~3.6KB (Dockerfile, requirements.txt, strands-agent.py),
+  # so a ConfigMap carries it with room to spare -- no S3 upload, no git clone.
+  kubectl create configmap strands-build-context \
+    --from-file=Dockerfile="${BUILD_CTX}/Dockerfile" \
+    --from-file=requirements.txt="${BUILD_CTX}/requirements.txt" \
+    --from-file=strands-agent.py="${BUILD_CTX}/strands-agent.py" \
+    --dry-run=client -o yaml | kubectl apply -f -
+
+  # ECR auth as a docker config.json. Written via mktemp with a trap so the token
+  # never sits in the repo, in the shell history, or in the outputs/ transcript.
+  ECR_CFG=$(mktemp); chmod 600 "$ECR_CFG"
+  trap 'rm -f "$ECR_CFG"' EXIT
+  ECR_AUTH=$(printf 'AWS:%s' "$(aws ecr get-login-password --region "$AWS_REGION")" | base64 | tr -d '\n')
+  printf '{"auths":{"%s":{"auth":"%s"}}}' "$ECR_REGISTRY" "$ECR_AUTH" > "$ECR_CFG"
+  kubectl create secret generic ecr-push-creds \
+    --from-file=config.json="$ECR_CFG" --dry-run=client -o yaml | kubectl apply -f -
+  rm -f "$ECR_CFG"; trap - EXIT
+
+  kubectl delete job strands-build --ignore-not-found >/dev/null
+  cat <<EOF | kubectl apply -f -
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: strands-build
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      # This is a long-ish build with nothing else on the node -- exactly the
+      # shape Karpenter consolidates out from under you (DIAGNOSTICS9.md bug 3).
+      annotations:
+        karpenter.sh/do-not-disrupt: "true"
+    spec:
+      restartPolicy: Never
+      # Build where it will RUN. This is the line that makes "exec format error"
+      # structurally impossible rather than merely fixed.
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      containers:
+        - name: buildkit
+          # Pinned, not :latest -- a build tool that silently changes version is
+          # how a reproducible build stops being one. linux/amd64 confirmed
+          # present in this tag's manifest list.
+          image: moby/buildkit:v0.32.2-rootless
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            seccompProfile: { type: Unconfined }
+            appArmorProfile: { type: Unconfined }
+          env:
+            - name: BUILDKITD_FLAGS
+              value: --oci-worker-no-process-sandbox
+            - name: DOCKER_CONFIG
+              value: /home/user/.docker
+          command: [ "buildctl-daemonless.sh" ]
+          args:
+            - build
+            - --frontend=dockerfile.v0
+            - --local=context=/workspace
+            - --local=dockerfile=/workspace
+            - --opt=platform=linux/amd64
+            - --output=type=image,name=${ECR_REPO}:latest,push=true
+          volumeMounts:
+            - { name: context, mountPath: /workspace }
+            - { name: ecr, mountPath: /home/user/.docker }
+          resources:
+            requests: { cpu: "500m", memory: 1Gi }
+            limits:   { cpu: "1",    memory: 2Gi }
+      volumes:
+        - name: context
+          configMap: { name: strands-build-context }
+        - name: ecr
+          secret: { secretName: ecr-push-creds }
+EOF
+
+  log "Waiting for the in-cluster build (first run pulls the buildkit image; expect 2-4 min)..."
+  BUILD_DEADLINE=$(( $(date +%s) + ${BUILD_TIMEOUT:-900} ))
+  BUILD_STATE="running"
+  while [ "$(date +%s)" -lt "$BUILD_DEADLINE" ]; do
+    if [ "$(kubectl get job strands-build -o jsonpath='{.status.succeeded}' 2>/dev/null)" = "1" ]; then
+      BUILD_STATE="ok"; break
+    fi
+    if [ -n "$(kubectl get job strands-build -o jsonpath='{.status.failed}' 2>/dev/null)" ]; then
+      BUILD_STATE="failed"; break
+    fi
+    sleep 5
+  done
+
+  log "Build log:"
+  kubectl logs job/strands-build --tail=40 2>/dev/null || true
+  # Delete the credential as soon as it is no longer needed, whatever happened.
+  kubectl delete secret ecr-push-creds --ignore-not-found >/dev/null
+
+  case "$BUILD_STATE" in
+    ok)     log "Image built and pushed to ${ECR_REPO}:latest by the cluster." ;;
+    failed) die "The in-cluster build failed (log above). Re-run with USE_LOCAL_DOCKER=1 to fall back to a local Docker build." ;;
+    *)      die "The in-cluster build did not finish within ${BUILD_TIMEOUT:-900}s. Check: kubectl describe job strands-build" ;;
+  esac
+fi
 
 log "Deploying agent, pointed at vllm-serve-svc..."
 cat <<'EOF' > "${MANIFEST_DIR}/600-strands-agent/vllm-deployment-agents.yaml"

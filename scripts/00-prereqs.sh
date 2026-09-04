@@ -14,159 +14,52 @@ source lib/env.sh
 
 log "Checking required CLI tools..."
 missing=()
-for tool in aws kubectl helm terraform docker jq envsubst curl; do
+# docker is deliberately NOT in this list. 05-agentic-app.sh builds its image
+# in-cluster now, so a local Docker daemon is optional -- see the check below.
+for tool in aws kubectl helm terraform jq envsubst curl; do
   command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
 done
 if [ "${#missing[@]}" -gt 0 ]; then
   die "Missing required tools: ${missing[*]}. Install these before continuing."
 fi
-log "All required tools present: aws kubectl helm terraform docker jq envsubst curl"
+log "All required tools present: aws kubectl helm terraform jq envsubst curl"
 
-# `command -v docker` proves only that the CLI is installed. 05-agentic-app.sh
-# needs the DAEMON, and the two fail very differently: `docker login` against ECR
-# succeeds with no daemon at all (it only writes a credential into the local
-# docker config), so the run gets a reassuring "Login Succeeded" and then dies on
-# the next line:
-#     ERROR: failed to connect to the docker API at unix:///var/run/docker.sock;
-#     check if the path is correct and if the daemon is running
-# Checking it here costs one local call and moves the failure to the script whose
-# job is to find problems. Not fatal -- 05 is the only script that needs it, and
-# everything else in the workshop runs fine without it.
-set +e
-docker_daemon_check
-DOCKER_RC=$?
-set -e
-case "$DOCKER_RC" in
-  0)
-    log "Docker daemon is reachable."
-    ;;
-  1)
-    # A daemon IS running; the docker CLI is just pointed at a socket that does
-    # not exist. Repair it here rather than printing two commands to retype --
-    # this is the one local change this script makes (docker CLI config only:
-    # no AWS call, no cluster call, no cost, undo with 'docker context use default').
-    warn "'docker info' failed, but a Docker daemon IS running at ${DOCKER_ALT_SOCK}."
-    warn "Your docker context was pointing somewhere else. Repointing it..."
-    if docker_daemon_autofix; then
-      log "Docker now works via context '${DOCKER_CTX_NAME}' -> unix://${DOCKER_ALT_SOCK}"
-      log "  (this persists across shells; undo with: docker context use default)"
-    else
-      warn "Could not repoint the docker context automatically. Do it by hand:"
-      while IFS= read -r line; do warn "$line"; done <<< "$(docker_daemon_advice)"
-      DOCKER_DAEMON_DOWN=1
-    fi
-    ;;
-  *)
-    warn "Docker CLI is installed but 'docker info' failed."
-    warn "Only 05-agentic-app.sh needs the daemon (it builds and pushes the Strands agent image); 00-04 and 06-11 do not."
-    while IFS= read -r line; do warn "$line"; done <<< "$(docker_daemon_advice)"
-    DOCKER_DAEMON_DOWN=1
-    ;;
-esac
-
-log "Checking AWS identity..."
-# Masked rather than printed raw (account ID + ARN would otherwise land in
-# the .out.txt transcript scripts/lib/env.sh writes for every run — see
-# README's "Every script's full terminal output" note. Only the account ID
-# is a secret worth hiding here; UserId/session name aren't credentials.
-IDENTITY_JSON=$(aws sts get-caller-identity --output json 2>/dev/null) \
-  || die "AWS CLI not authenticated. Run 'aws configure' or set up SSO first."
-ACCOUNT_ID=$(echo "$IDENTITY_JSON" | jq -r '.Account')
-ARN=$(echo "$IDENTITY_JSON" | jq -r '.Arn')
-MASKED_ACCOUNT="********${ACCOUNT_ID: -4}"
-MASKED_ARN="${ARN/$ACCOUNT_ID/$MASKED_ACCOUNT}"
-log "Authenticated as: ${MASKED_ARN} (account ${MASKED_ACCOUNT})"
-
-# --- Free Tier plan launch restriction ---------------------------------------
-# THE single most expensive gotcha in this repo. See DIAGNOSTICS0.md-DIAGNOSTICS8.md.
-#
-# An AWS account on the *new* Free Tier plan (accountPlanType == FREE, the default
-# for accounts created since the 2025 Free Tier redesign) may only launch instance
-# types that are Free-Tier-eligible -- currently a set of six. Every other type is
-# refused. This is a property of the account PLAN, not a transient hold, so it does
-# NOT clear by waiting, and it is completely independent of service quotas: you can
-# hold a granted 16-vCPU GPU quota and still be unable to launch a single g6e.
-#
-# It is invisible at the Kubernetes/Terraform layer. Karpenter's NodeClaims churn
-# forever with `FreeTierIneligible`, and the underlying error only appears in a raw
-# CloudTrail CreateFleet event body -- CreateFleet returns HTTP 200 and buries the
-# rejection in `errorSet.item`:
-#     errorCode:    InvalidParameterCombination
-#     errorMessage: "The specified instance type is not eligible for Free Tier."
-#
-# DO NOT "detect" this with a dry-run. Three dry-run signals were measured against a
-# genuinely blocked g6e.2xlarge (DIAGNOSTICS8.md) and ALL THREE reported success:
-#   1. `aws ec2 run-instances --dry-run`  -> DryRunOperation   (what this script used
-#      to do; it never evaluates Free Tier eligibility at all)
-#   2. `aws ec2 create-fleet  --dry-run`  -> DryRunOperation   (returned success even
-#      with a launch-template id that did not exist -- it validates almost nothing)
-#   3. Karpenter's own internal CreateFleet dry-run -> Client.DryRunOperation
-# Only a REAL CreateFleet surfaces it, and a real CreateFleet launches an instance.
-#
-# So this gate is authoritative instead of empirical: ask what plan the account is on,
-# ask which types that plan permits, and compare. Zero cost, no cluster, no launch
-# template, and it runs correctly before anything has been deployed.
-#
-# A FREE plan is FATAL here, not advisory. This used to warn and let the run continue
-# to 01, on the reasoning that 01 itself succeeds on a FREE plan -- but 01 succeeding
-# is precisely the trap: it bills for a NAT gateway and an EKS control plane to stand
-# up a cluster whose entire purpose is a GPU node that can never join it.
-PLAN_BLOCKS_GPU=0
-# Shared with 02-gpu-infrastructure.sh via free_tier_check() in lib/env.sh, so the
-# two gates can never disagree about what this account can launch.
-log "Checking the account's Free Tier plan (this gates which instance types can launch at all)..."
-set +e
-free_tier_check "$INSTANCE_TYPE"
-FT_RC=$?
-set -e
-case "$FT_RC" in
-  0)
-    if [ "$FT_PLAN_TYPE" = "FREE" ]; then
-      log "Account is on the FREE plan, but ${INSTANCE_TYPE} is Free-Tier-eligible — the GPU node can launch."
-    else
-      log "Account plan is ${FT_PLAN_TYPE} — no Free Tier instance-type restriction."
-    fi
-    ;;
-  1)
-    warn "This account is on the FREE plan. It can ONLY launch these instance types in ${AWS_REGION}:"
-    warn "  $(echo "$FT_ELIGIBLE_TYPES" | tr '\n' ' ')"
-    warn "${INSTANCE_TYPE} is NOT among them, so no script in this repo can launch a GPU node on this account, no matter what the GPU quota says."
-    warn "This does NOT clear by waiting — it is the account's plan, not a temporary validation hold. Upgrade first:"
-    warn "  aws freetier upgrade-account-plan --account-plan-type PAID"
-    warn "  (or: AWS Billing console -> Free Tier -> 'Upgrade to a paid plan')"
-    warn "Then re-run this script. It will pass once the plan reads PAID."
-    PLAN_BLOCKS_GPU=1
-    # 01-deploy-infra.sh survives a FREE plan only because Karpenter's system and
-    # general-purpose pools accept a wide instance-type range and can fall back to an
-    # eligible one (c7i-flex.large, on the reference account). The gpu NodePool is
-    # pinned to exactly one type, so it has no fallback — that asymmetry is why
-    # DIAGNOSTICS0-7 read the failure as "intermittent, seems to be clearing".
-    if ! echo "$FT_ELIGIBLE_TYPES" | grep -qE '^(c7i-flex|m7i-flex)\.large$'; then
-      warn "No flex-class type is Free-Tier-eligible in ${AWS_REGION} either — 01-deploy-infra.sh's system/general-purpose NodePools would not find a launchable type here at all."
-    fi
-    # STOP HERE. Everything below this point (quota, ODCR, and every later script)
-    # is moot on a FREE plan: 02-gpu-infrastructure.sh creates a ${ODCR_HOURS}h On-Demand
-    # Capacity Reservation that bills the full ${INSTANCE_TYPE} rate from the moment it
-    # is created, for capacity no node will ever be able to occupy, and 01 stands up a
-    # NAT gateway + EKS control plane that can never run the workshop's GPU workload.
-    # The whole point of this script is to fail here rather than there.
-    warn "----------------------------------------------------------------------"
-    warn "STOPPING. Do not run 01-deploy-infra.sh or 02-gpu-infrastructure.sh on"
-    warn "this account: the GPU node they exist to create cannot be launched, and"
-    warn "both of them bill for real (NAT gateway + EKS control plane; a ${ODCR_HOURS}h"
-    warn "capacity reservation) while producing nothing. See DIAGNOSTICS8.md."
-    warn "----------------------------------------------------------------------"
-    warn "To override anyway — knowingly paying for infrastructure that cannot work:"
-    warn "  ALLOW_FREE_TIER_BLOCKED=1 ./00-prereqs.sh"
-    [ "${ALLOW_FREE_TIER_BLOCKED:-0}" = "1" ] \
-      || die "Account plan is FREE and ${INSTANCE_TYPE} is not launchable on it. Nothing was created, nothing was billed."
-    warn "ALLOW_FREE_TIER_BLOCKED=1 set — continuing the remaining checks anyway."
-    ;;
-  *)
-    warn "Could not read the account plan (needs aws-cli >= 2.22 and freetier:GetAccountPlanState). Skipping the Free Tier gate — if 01/02 later churn NodeClaims with 'FreeTierIneligible', this is why. Check manually:"
-    warn "  aws freetier get-account-plan-state"
-    ;;
-esac
+# Docker is OPTIONAL. 05-agentic-app.sh builds in-cluster by default, on an amd64
+# node, which is what removed this module's three laptop-shaped failures
+# (daemon down / wrong context / wrong architecture -- DIAGNOSTICS9.md). You only
+# need a local daemon if you opt back into the upstream path with
+# USE_LOCAL_DOCKER=1, so this reports and never blocks.
+if ! command -v docker >/dev/null 2>&1; then
+  log "Docker CLI not installed -- fine. 05 builds in-cluster; you would only need it for USE_LOCAL_DOCKER=1."
+else
+  set +e
+  docker_daemon_check
+  DOCKER_RC=$?
+  set -e
+  case "$DOCKER_RC" in
+    0)
+      log "Docker daemon is reachable (only needed for USE_LOCAL_DOCKER=1; 05 builds in-cluster by default)."
+      ;;
+    1)
+      # A daemon IS running; the docker CLI is just pointed at a socket that does
+      # not exist. Repair it here rather than printing two commands to retype --
+      # this is the one local change this script makes (docker CLI config only:
+      # no AWS call, no cluster call, no cost, undo with 'docker context use default').
+      warn "'docker info' failed, but a Docker daemon IS running at ${DOCKER_ALT_SOCK}."
+      warn "Your docker context was pointing somewhere else. Repointing it..."
+      if docker_daemon_autofix; then
+        log "Docker now works via context '${DOCKER_CTX_NAME}' -> unix://${DOCKER_ALT_SOCK}"
+        log "  (this persists across shells; undo with: docker context use default)"
+      else
+        warn "Could not repoint the docker context automatically. Only matters for USE_LOCAL_DOCKER=1:"
+        while IFS= read -r line; do warn "$line"; done <<< "$(docker_daemon_advice)"
+      fi
+      ;;
+    *)
+      log "Docker CLI present but no daemon reachable -- fine, 05 builds in-cluster. (USE_LOCAL_DOCKER=1 would need one.)"
+      ;;
+  esac
+fi
 
 log "Checking GPU instance quota for ${INSTANCE_TYPE} in ${AWS_REGION}..."
 # g6e instances fall under the "Running On-Demand G and VT instances" vCPU-based quota (L-DB2E81BA).
@@ -204,10 +97,6 @@ if [ "$PLAN_BLOCKS_GPU" -eq 1 ]; then
   warn "launch. 02-gpu-infrastructure.sh will still refuse on its own. Upgrade to"
   warn "a paid plan first. See DIAGNOSTICS8.md."
   warn "----------------------------------------------------------------------"
-fi
-
-if [ "${DOCKER_DAEMON_DOWN:-0}" -eq 1 ]; then
-  warn "REMINDER: the Docker daemon is down. 05-agentic-app.sh will fail at the image build (after a misleading 'Login Succeeded')."
 fi
 
 log "Prereqs check complete. Read docs/COST.md before running 01-deploy-infra.sh — this is not a free-tier-eligible repo."

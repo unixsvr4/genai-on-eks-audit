@@ -72,7 +72,9 @@ Most people cloning this will be on a new or lightly-used AWS account, and this 
 
 ## Quickstart
 
-Requires: `aws` CLI (authenticated), `kubectl`, `helm`, `terraform`, `docker`, `jq`, `envsubst`, `curl`, `git`.
+Requires: `aws` CLI (authenticated), `kubectl`, `helm`, `terraform`, `jq`, `envsubst`, `curl`, `git`.
+
+**No local Docker needed.** `05-agentic-app.sh` builds its container image *in-cluster*, on an amd64 node the cluster is already running. That is a deliberate deviation from the published workshop, which builds locally — three of that module's four live failures came from the laptop rather than from AWS (daemon not running; daemon running but the docker context pointed at a dead socket; an arm64 image built on Apple Silicon dying on an amd64 node with `exec format error`). Building where the image will run removes all three. It creates no AWS resources and costs nothing extra. Set `USE_LOCAL_DOCKER=1` to take the upstream path instead.
 
 ```bash
 cd scripts
