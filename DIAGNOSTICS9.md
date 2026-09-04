@@ -1359,3 +1359,85 @@ the ALBs had already gone.
 Two fixes now stand proven-then-superseded in the same way: each teardown has
 found the next ordering problem behind the one it fixed. This one is again
 verified statically and **not** yet exercised on a live destroy.
+
+
+---
+
+## Postscript 11 — the teardown completed, and the last error was self-inflicted
+
+```console
+module.vpc.aws_nat_gateway.this[0]: Destruction complete after 1m11s
+module.eks.aws_eks_cluster.this[0]: Destruction complete after 3m41s
+module.vpc.aws_vpc.this[0]: Destruction complete after 0s
+
+Destroy complete! Resources: 59 destroyed.
+```
+
+Then:
+
+```console
+./99-destroy-all.sh: line 130: raforms 5-minute delete timeout and ended the destroy with the generic
+STUCK=$(kubectl get pods -A -o json 2>/dev/null | python3 -c : No such file or directory
+```
+
+That is not a bug in the script. `bash -n` passed on it before and after. **The
+file was edited while it was running** — by me, adding the stuck-pod sweep during
+a live 15-minute teardown.
+
+Bash reads a script incrementally, by byte offset, as it executes. Insert 35 lines
+near the top of a running script and bash resumes at its saved offset, which now
+lands in the middle of newly-shifted text. `raforms` is the tail of `Terraform's`,
+read as a command. The running copy and the copy on disk had diverged.
+
+### The guard, and the version of it that was wrong
+
+The obvious fix is to wrap the body in `{ ... }` so bash parses it as one compound
+command. That was written, committed to the working tree, and asserted as
+sufficient. **It is not.** Measured with a deliberately edited script:
+
+| structure | result of an edit mid-run |
+|---|---|
+| plain | `START` \| `<garbage>` \| `END_REACHED` — corrupted |
+| `{ ... }` | `START` \| `END_REACHED` \| `START` \| `END_REACHED` \| syntax error — **body ran twice** |
+| `{ ... exit 0; }` | `START` \| `END_REACHED` — clean, exactly once |
+
+The brace group makes the body run correctly *once*, and then bash keeps reading
+past the closing brace at the shifted offset and runs it **again**. For a teardown
+script, running the body twice is worse than the original corruption.
+
+`exit 0` as the last statement *inside* the group is what actually stops it, by
+ending the shell before bash can read further. Both parts are needed. Confirmed on
+the real script with its `source`/`cd` stubbed out and five lines inserted 0.5s
+into the run: `REAL_BODY_START | REAL_BODY_END`, once.
+
+The first claim was made the same way as several others in this round — a
+plausible mechanism asserted without being run. The difference is that this one
+was caught by testing it, and the test is in the file's comment so the next reader
+does not have to re-derive it.
+
+### Teardown verified
+
+The verification block — never reached on the broken run — was run separately
+against the account:
+
+```console
+  clean    EKS clusters                 clean    AMP workspaces
+  clean    NAT gateways                 clean    Non-default VPCs
+  clean    Load balancers               clean    Unattached EBS volumes
+  clean    Active capacity reservations clean    Instances (backstop only)
+  clean    Elastic IPs                  clean    ElastiCache serverless (Valkey)
+=== Teardown verified: nothing billable left in us-east-2. ===
+```
+
+Ten checks, all clean, exit 0. The same block correctly reported **six** remaining
+groups when it was tested against the deployed cluster, so this is a real negative
+rather than a verifier that only knows how to say yes.
+
+### What the two destroy runs proved
+
+- **Run 1**: the `module.vpc` edges from `DIAGNOSTICS8.md` held on first live
+  contact — no VPC resource was torn down alongside the Kubernetes layer. It
+  failed on a *different* race (namespace vs NodePool), now fixed by the
+  `karpenter_node_pool_gpu` edge, which remains unexercised.
+- **Run 2**: completed cleanly — 59 resources destroyed, NAT gateway at 1m11s,
+  EKS cluster at 3m41s, VPC last. Nothing billable remains.

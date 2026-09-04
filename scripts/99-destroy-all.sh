@@ -10,6 +10,31 @@
 #
 # Every kubectl/helm delete is guarded with `|| true` so this is safe to re-run
 # and safe to run even if you skipped some modules.
+#
+# The whole body is wrapped in a { ... } brace group ON PURPOSE. Bash reads a
+# script incrementally, by byte offset, WHILE it runs -- so editing a script that
+# is currently executing makes it resume at the old offset in newly-shifted text.
+# Observed 2026-09-04: this file was edited during a live 15-minute teardown, and
+# after `Destroy complete! Resources: 59 destroyed.` bash resumed mid-comment and
+# produced garbage:
+#     ./99-destroy-all.sh: line 130: raforms 5-minute delete timeout ...
+#     STUCK=$(kubectl get pods ... | python3 -c : No such file or directory
+# The script was valid the whole time (`bash -n` passed); the running copy was
+# not the copy on disk.
+#
+# The brace group makes bash parse the entire body as ONE compound command before
+# executing any of it. That alone is NOT sufficient -- measured: bash finishes the
+# group, then keeps reading at the now-shifted offset and runs the body a SECOND
+# time. The `exit 0` at the end of the group is what actually stops it, by ending
+# the shell before bash can read past the closing brace. Both parts are required:
+#
+#   plain           START | <garbage> | END_REACHED      (corrupted)
+#   brace only      START | END_REACHED | START | END_REACHED | syntax error
+#   brace + exit    START | END_REACHED                  (clean, exactly once)
+#
+# Cheap insurance for a script that runs a quarter of an hour and tears down
+# everything you have.
+{
 set -euo pipefail
 cd "$(dirname "$0")"
 source lib/env.sh
@@ -207,3 +232,8 @@ else
   warn "======================================================================"
   exit 1
 fi
+
+# MUST stay inside the brace group -- see the note at the top of this file.
+# Only reached on the success path; the verification above exits 1 on leftovers.
+exit 0
+} # end brace group
