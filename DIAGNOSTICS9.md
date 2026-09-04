@@ -948,3 +948,103 @@ The current time in Dallas is **11:03 AM CDT** (Central Daylight Time).
 
 which is tool-calling working end to end against the vLLM backend. 05 had in fact
 succeeded; only the guard disagreed.
+
+
+---
+
+## Postscript 6 — moving the build off the laptop, and what that cost to get right
+
+`05` now builds its image **in-cluster** by default. The case was empirical: of
+the module's four failures, three were properties of the developer machine and
+none were AWS problems — daemon not running, daemon running but the docker
+context pointed at a dead socket, and an arm64 image on an amd64 node. Building
+where the image will run removes the class rather than fixing the instances.
+There is no daemon to be down, no context to be wrong, and the `nodeSelector`
+that places the build job is the same one that places the workload, so the build
+architecture *is* the run architecture.
+
+Chosen over AWS CodeBuild deliberately. CodeBuild is the conventional answer and
+works, but it adds an IAM service role, a build project and an S3 source upload —
+three more things to create and, more to the point, three more to destroy.
+Teardown has been this repo's most expensive recurring problem. The in-cluster
+job creates **no AWS resource at all**: a ConfigMap, a Secret and a Job, all of
+which die with the cluster.
+
+Two failures on the way, both worth recording because both would hit anyone
+copying this pattern onto EKS Auto Mode.
+
+### Rootless BuildKit cannot run on Bottlerocket
+
+The obvious choice — BuildKit is maintained, kaniko is archived — failed
+immediately:
+
+```console
+$ kubectl logs -l job-name=strands-build
+time="..." level=warning msg="[rootlesskit:parent] /proc/sys/user/max_user_namespaces needs to be set to non-zero."
+[rootlesskit:parent] error: failed to start the child: fork/exec /proc/self/exe: no space left on device
+could not connect to unix:///run/user/1000/buildkit/buildkitd.sock after 10 trials
+```
+
+Bottlerocket — the AMI EKS Auto Mode uses — sets `user.max_user_namespaces=0`, so
+rootlesskit cannot create the namespace it needs. **`no space left on device` is
+not a disk problem**; it is the errno the kernel returns when the user-namespace
+limit refuses the clone, and it sends you looking at ephemeral storage for an
+hour if you take it at face value.
+
+The alternatives were `privileged: true` (a bad trade for building a 4KB context)
+or a builder that needs neither. kaniko extracts and snapshots layers inside its
+own filesystem, so it runs unprivileged with no securityContext at all. It is
+archived upstream, which is a genuine drawback accepted knowingly: it is the only
+unprivileged in-cluster builder that works on this AMI without node-level
+changes, it is pinned, and it does one narrow job. Revisit if Bottlerocket ever
+permits user namespaces.
+
+### A ConfigMap volume is a symlink farm
+
+kaniko then ran, and the build failed inside `pip`:
+
+```console
+ERROR: Could not open requirements file: [Errno 2] No such file or directory: 'requirements.txt'
+error building image: error building stage: failed to execute command: exit status 1
+```
+
+The file was mounted and present. A ConfigMap volume materialises every key as a
+**symlink** into a hidden `..data/` directory, and kaniko's `COPY` copies the
+symlink rather than following it — so it lands in the image as a dangling link,
+and the error reports the file as simply missing. An init container running
+`cp -rL` into an `emptyDir` gives kaniko ordinary files. It pulls busybox from
+the ECR public mirror rather than Docker Hub, to stay clear of anonymous pull
+limits.
+
+### Verified end to end
+
+```console
+$ kubectl get pods -l job-name=strands-build
+strands-build-cg6pd   0/1   Completed   0   51s
+
+$ kubectl logs -l job-name=strands-build -c kaniko --tail=2
+INFO[0032] Pushing image to <acct>.dkr.ecr.us-east-2.amazonaws.com/strands-weather-agent:latest
+INFO[0036] Pushed ...@sha256:e5368d07eced75b5...
+```
+
+51 seconds, native — against roughly 90s of QEMU-emulated `pip install` locally.
+Then the real proof, deploying what the cluster built:
+
+```console
+$ kubectl rollout restart deployment/strands-weather-agent
+$ kubectl get pods -l app=strands-weather-agent
+strands-weather-agent-5c664b6c9b-vx88q   1/1   Running   0   41s
+
+$ kubectl logs -l app=strands-weather-agent --tail=2
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000
+
+pod -> i-<node> amd64
+```
+
+No `exec format error`, on the architecture that produced one twice. All build
+artifacts (Job, ConfigMap, Secret) were deleted afterwards, as the script does.
+
+`docker` is no longer in `00-prereqs.sh`'s required-tools list. `USE_LOCAL_DOCKER=1`
+keeps the upstream-faithful local path, documented in the README as a deliberate
+deviation from the published workshop.

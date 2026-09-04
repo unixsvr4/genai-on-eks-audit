@@ -122,44 +122,64 @@ spec:
       # structurally impossible rather than merely fixed.
       nodeSelector:
         kubernetes.io/arch: amd64
+      initContainers:
+        # A ConfigMap volume is a SYMLINK FARM -- every key is a symlink into a
+        # hidden ..data/ directory. kaniko's COPY copies the symlink rather than
+        # following it, so the file lands in the image as a dangling link and the
+        # build fails with an error that names the file as simply missing:
+        #     ERROR: Could not open requirements file:
+        #     [Errno 2] No such file or directory: 'requirements.txt'
+        # Measured 2026-09-04. `cp -rL` dereferences into an emptyDir, so kaniko
+        # sees ordinary files. Uses the ECR public mirror rather than Docker Hub
+        # to stay clear of anonymous pull limits.
+        - name: stage-context
+          image: public.ecr.aws/docker/library/busybox:1.37
+          command: [ "sh", "-c", "cp -rL /cm/. /workspace/ && ls -l /workspace" ]
+          volumeMounts:
+            - { name: cm, mountPath: /cm }
+            - { name: context, mountPath: /workspace }
       containers:
-        - name: buildkit
-          # Pinned, not :latest -- a build tool that silently changes version is
-          # how a reproducible build stops being one. linux/amd64 confirmed
-          # present in this tag's manifest list.
-          image: moby/buildkit:v0.32.2-rootless
-          securityContext:
-            runAsUser: 1000
-            runAsGroup: 1000
-            seccompProfile: { type: Unconfined }
-            appArmorProfile: { type: Unconfined }
-          env:
-            - name: BUILDKITD_FLAGS
-              value: --oci-worker-no-process-sandbox
-            - name: DOCKER_CONFIG
-              value: /home/user/.docker
-          command: [ "buildctl-daemonless.sh" ]
+        # kaniko, not BuildKit. Rootless BuildKit CANNOT run on Bottlerocket, which
+        # is the AMI EKS Auto Mode uses: it sets user.max_user_namespaces=0, so
+        # rootlesskit cannot create the user namespace it needs. Measured
+        # 2026-09-04 -- and the errno is deeply unhelpful:
+        #     /proc/sys/user/max_user_namespaces needs to be set to non-zero
+        #     failed to start the child: fork/exec /proc/self/exe:
+        #         no space left on device
+        # That is not a disk problem. The alternative would be privileged: true,
+        # which is a bad trade for building a 4KB context. kaniko needs neither
+        # user namespaces nor privilege -- it extracts and snapshots layers in its
+        # own filesystem -- so it works unmodified here.
+        #
+        # kaniko is archived upstream and that is a real drawback, accepted
+        # deliberately: it is the only unprivileged in-cluster builder that runs
+        # on this AMI without node-level changes. It is pinned, and the image is
+        # doing one narrow job. Revisit if Bottlerocket ever permits user
+        # namespaces.
+        - name: kaniko
+          image: gcr.io/kaniko-project/executor:v1.24.0
           args:
-            - build
-            - --frontend=dockerfile.v0
-            - --local=context=/workspace
-            - --local=dockerfile=/workspace
-            - --opt=platform=linux/amd64
-            - --output=type=image,name=${ECR_REPO}:latest,push=true
+            - --dockerfile=/workspace/Dockerfile
+            - --context=dir:///workspace
+            - --destination=${ECR_REPO}:latest
+            # No --custom-platform: the node IS amd64, so the natural build
+            # target is already correct. That is the entire point of building here.
           volumeMounts:
             - { name: context, mountPath: /workspace }
-            - { name: ecr, mountPath: /home/user/.docker }
+            - { name: ecr, mountPath: /kaniko/.docker }
           resources:
             requests: { cpu: "500m", memory: 1Gi }
             limits:   { cpu: "1",    memory: 2Gi }
       volumes:
-        - name: context
+        - name: cm
           configMap: { name: strands-build-context }
+        - name: context
+          emptyDir: {}
         - name: ecr
           secret: { secretName: ecr-push-creds }
 EOF
 
-  log "Waiting for the in-cluster build (first run pulls the buildkit image; expect 2-4 min)..."
+  log "Waiting for the in-cluster build (first run pulls the kaniko image; expect 2-4 min)..."
   BUILD_DEADLINE=$(( $(date +%s) + ${BUILD_TIMEOUT:-900} ))
   BUILD_STATE="running"
   while [ "$(date +%s)" -lt "$BUILD_DEADLINE" ]; do
