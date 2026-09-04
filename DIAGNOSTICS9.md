@@ -1048,3 +1048,67 @@ artifacts (Job, ConfigMap, Secret) were deleted afterwards, as the script does.
 `docker` is no longer in `00-prereqs.sh`'s required-tools list. `USE_LOCAL_DOCKER=1`
 keeps the upstream-faithful local path, documented in the README as a deliberate
 deviation from the published workshop.
+
+
+---
+
+## Postscript 7 — the teardown script ended in advice, not a check
+
+`99-destroy-all.sh` finished with:
+
+```
+=== Teardown complete. Verify in the AWS console that no g6e.2xlarge instances,
+=== ODCRs, NAT gateways, or ALBs remain — those are the line items that keep billing.
+```
+
+That is an instruction to a human, on the one step in the repo where being wrong
+costs money by the hour, in a repo whose most expensive recurring problem has
+been teardown. Same shape as everything else in this round: a real check replaced
+by a confident-sounding stand-in.
+
+It now verifies: EKS clusters, NAT gateways, load balancers, active ODCRs,
+Elastic IPs, ElastiCache serverless, AMP workspaces, non-default VPCs, unattached
+EBS volumes, and instances — printing `clean` or `REMAINS <ids>` per group and
+exiting 1 if anything is left.
+
+### Tested by running it while everything was still up
+
+A verifier that always prints "clean" is worse than none, so it was run against
+the fully-deployed cluster, where it must light up:
+
+```console
+[LOG] === Verifying teardown (checking the line items that keep billing) ===
+[WARN]   REMAINS  EKS clusters: genai-workshop
+[WARN]   REMAINS  NAT gateways: nat-<redacted>
+[WARN]   REMAINS  Load balancers: grafana-ingress
+[LOG]   clean    Active capacity reservations
+[WARN]   REMAINS  Elastic IPs: (4)
+[LOG]   clean    ElastiCache serverless (Valkey)
+[WARN]   REMAINS  AMP workspaces: ws-<redacted>
+[WARN]   REMAINS  Non-default VPCs: vpc-<redacted>
+[LOG]   clean    Unattached EBS volumes
+[LOG]   clean    Instances (backstop only -- Auto Mode nodes are hidden here)
+[WARN] 6 resource group(s) still present in us-east-2 — THESE ARE STILL BILLING.
+```
+
+Every `clean` line is independently correct: no ODCR was ever created (all three
+AZs refused), `08-lmcache-valkey.sh` did tear its Valkey down, and no EBS volume
+was detached.
+
+**And the run demonstrates the blind spot in the same breath.** The instance check
+printed `clean` while three nodes were running, one of them the `g6e.2xlarge` at
+$2.24/hr. EKS Auto Mode's nodes carry
+`Operator{Managed:true, HiddenByDefault:true}` and are omitted from an unfiltered
+`describe-instances`, so the most obvious cost check in AWS reports nothing while
+the most expensive resource in the account bills. That is why it is labelled a
+backstop and why the EKS-cluster check is the one that actually covers nodes:
+Auto Mode nodes cannot outlive their cluster.
+
+### Two things checked before the destroy, both fine
+
+- The destroy-ordering fix from `DIAGNOSTICS8.md` **is** applied to the live
+  clone (`fix_destroy_order.py` reports `5 already patched`), so the next
+  teardown is its first real exercise, as intended.
+- `aws_s3_bucket.model_storage` carries `force_destroy = true`, so the 9.7GB of
+  model weights will not block `terraform destroy` — worth confirming rather than
+  discovering at the end of a destroy.

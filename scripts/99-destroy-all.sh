@@ -120,5 +120,59 @@ else
 If you deployed manually, tear down the VPC/EKS cluster/S3 model bucket yourself."
 fi
 
-log "=== Teardown complete. Verify in the AWS console that no g6e.2xlarge instances, ==="
-log "=== ODCRs, NAT gateways, or ALBs remain — those are the line items that keep billing. ==="
+# --- Post-destroy verification ------------------------------------------------
+# This used to say "verify in the AWS console that nothing remains", which is
+# advice rather than a check, on the one step where being wrong costs money by
+# the hour. Teardown has been this repo's most expensive recurring problem
+# (DIAGNOSTICS8.md, DIAGNOSTICS9.md), so verify it here.
+#
+# NOTE on instances: EKS Auto Mode's nodes carry
+# Operator{Managed:true, HiddenByDefault:true} and are OMITTED from an unfiltered
+# `describe-instances` -- a blanket scan reports zero while a g6e.2xlarge bills at
+# $2.24/hr (docs/GOTCHAS.md). They cannot outlive their cluster, so the EKS check
+# below is the one that actually covers them; the instance check is a backstop and
+# is labelled as such rather than trusted.
+log "=== Verifying teardown (checking the line items that keep billing) ==="
+LEFTOVERS=0
+check_gone() {  # <label> <command...>
+  local label="$1"; shift
+  local found
+  found=$("$@" 2>/dev/null | tr '\t' ' ' | tr -s ' ' | sed '/^\s*$/d' | head -5)
+  if [ -z "$found" ]; then
+    log "  clean    ${label}"
+  else
+    LEFTOVERS=$((LEFTOVERS + 1))
+    warn "  REMAINS  ${label}: $(echo "$found" | tr '\n' ' ')"
+  fi
+}
+
+check_gone "EKS clusters" \
+  aws eks list-clusters --region "$AWS_REGION" --query 'clusters' --output text
+check_gone "NAT gateways" \
+  aws ec2 describe-nat-gateways --region "$AWS_REGION" --filter Name=state,Values=available,pending --query 'NatGateways[].NatGatewayId' --output text
+check_gone "Load balancers" \
+  aws elbv2 describe-load-balancers --region "$AWS_REGION" --query 'LoadBalancers[].LoadBalancerName' --output text
+check_gone "Active capacity reservations" \
+  aws ec2 describe-capacity-reservations --region "$AWS_REGION" --filters Name=state,Values=active --query 'CapacityReservations[].CapacityReservationId' --output text
+check_gone "Elastic IPs" \
+  aws ec2 describe-addresses --region "$AWS_REGION" --query 'Addresses[].AllocationId' --output text
+check_gone "ElastiCache serverless (Valkey)" \
+  aws elasticache describe-serverless-caches --region "$AWS_REGION" --query 'ServerlessCaches[].ServerlessCacheName' --output text
+check_gone "AMP workspaces" \
+  aws amp list-workspaces --region "$AWS_REGION" --query 'workspaces[].workspaceId' --output text
+check_gone "Non-default VPCs" \
+  aws ec2 describe-vpcs --region "$AWS_REGION" --filters Name=isDefault,Values=false --query 'Vpcs[].VpcId' --output text
+check_gone "Unattached EBS volumes" \
+  aws ec2 describe-volumes --region "$AWS_REGION" --filters Name=status,Values=available --query 'Volumes[].VolumeId' --output text
+check_gone "Instances (backstop only -- Auto Mode nodes are hidden here)" \
+  aws ec2 describe-instances --region "$AWS_REGION" --filters Name=instance-state-name,Values=running,pending --query 'Reservations[].Instances[].InstanceId' --output text
+
+if [ "$LEFTOVERS" -eq 0 ]; then
+  log "=== Teardown verified: nothing billable left in ${AWS_REGION}. ==="
+else
+  warn "======================================================================"
+  warn "${LEFTOVERS} resource group(s) still present in ${AWS_REGION} — THESE ARE STILL BILLING."
+  warn "Re-run this script; if something persists, delete it by hand (see docs/COST.md)."
+  warn "======================================================================"
+  exit 1
+fi
