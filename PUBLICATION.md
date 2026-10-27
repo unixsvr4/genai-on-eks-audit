@@ -51,6 +51,34 @@ that commit was a note about improving the masking. `--replace-message`
 with the same rules is required, and the verification has to read
 `git log` and not only the object store.
 
+## Round two, after the first push — what a secret scan does not catch
+
+The first sweep looked for credentials and identifiers and found them. It
+did not look for **references to things outside the repo**, and three of
+those shipped in the first push:
+
+- A markdown link in `README.md` pointing two directories up into a
+  separate private repo, with a filename and a note that post scheduling
+  is tracked there. A 404 for every reader, and it named a private repo.
+- An earlier variant of the same link, one directory up, in a
+  pre-restructure revision of the root `README.md`, plus a file-tree
+  listing naming the same draft. Only in history, which is exactly why a
+  tree-only scan missed them.
+- 23 xterm title escape sequences inside the committed transcripts in
+  `outputs/`, each carrying a username, a hostname and a local directory
+  path. Zero of them were in any current file; all 23 were in history.
+
+Also found and fixed: a dangling link in `docs/GOTCHAS.md` to a document
+that had been moved out of the repo months earlier.
+
+**The lesson worth keeping.** A credential scan asks "is there a secret
+here". Publishing also requires asking "does anything point outside this
+repo, and does anything identify the machine it ran on". Those are
+different questions, and the second is the one that got missed. A captured
+terminal transcript is the highest-risk file type for it, because the
+shell writes username, hostname and path into the stream as control
+characters no reader ever sees.
+
 ## Left in deliberately
 
 - `i-`, `subnet-` and `sg-` identifiers throughout the diagnostics. They
@@ -80,6 +108,13 @@ working tree:
     git ls-files -z | xargs -0 grep -hEo \
       "AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}" | sort -u
     git ls-files -z | xargs -0 grep -hEo "cr-[0-9a-f]{8,}" | sort -u
+
+Then the questions a secret scan does not ask. Anything pointing outside
+the repo, anything naming the machine, and any relative link that does
+not resolve:
+
+    git ls-files -z | xargs -0 grep -nE "\]\(\.\./\.\./|/Users/|/home/"
+    git ls-files -z | xargs -0 grep -naE "[a-z0-9_-]+@[a-z0-9-]+:~"
 
 Then history, both objects and messages:
 
