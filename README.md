@@ -6,6 +6,27 @@ This isn't a slide-deck summary. Every command in this repo's `scripts/` was ver
 
 ![Complete architecture](./images/14-architecture-complete-7-agentic.png)
 
+## One workload, three clouds — this is the AWS one
+
+The same workload (Ministral-3-8B-Instruct on vLLM behind a GPU-backed
+managed Kubernetes cluster, with observability, KV-cache tiering, RAG and an
+agentic app on top) is being reproduced independently on all three major
+clouds, so the architectures can be compared on measurements rather than on
+each vendor's own marketing.
+
+**AWS is complete and is what this repository contains.** GCP and Azure are
+in progress in parallel and are deliberately not published yet — an
+incomplete reproduction invites exactly the kind of unmeasured comparison
+this project exists to avoid. A few cross-cloud differences already worth
+knowing, measured on the parts that do run:
+
+- No L4 GPU exists on Azure, so the Azure path runs a T4 with 16GB against
+  this L40S with 46GB, which forced a different model and a smaller KV cache.
+- LMCache's CPU-RAM L1 tier sizes to host RAM, not to the GPU, so the same
+  manifest yields a different cache on each provider.
+
+The comparison table goes up when all three have actually run end to end.
+
 ## What this actually deploys
 
 Ministral-3-8B-Instruct-2512 served on vLLM via **EKS Auto Mode**, on the same `g6e.2xlarge` (1x NVIDIA L40S, 46GB VRAM) instance type the workshop uses — streamed straight from S3, no manual GPU driver install, no manually-picked AMI (Auto Mode selects its own Bottlerocket GPU variant, same as the workshop). On top of that:
@@ -60,7 +81,7 @@ Most people cloning this will be on a new or lightly-used AWS account, and this 
    ```
    `00-prereqs.sh` checks the account plan against the eligible-type set and **exits non-zero** on a FREE plan — it stops the run there rather than letting you walk into `01-deploy-infra.sh` (which bills for a NAT gateway and an EKS control plane, and *succeeds*, standing up a cluster the GPU node can never join) or `02-gpu-infrastructure.sh` (which creates a 4-hour capacity reservation billing $2.24/hr **before** it discovers whether a GPU node can launch). 02 gates independently, so skipping 00 does not get you past it. Override either with `ALLOW_FREE_TIER_BLOCKED=1` if you want to see it fail for yourself — you pay for that.
 
-3. **The model-download Job can fail silently for an hour.** Not account-level — this one hits everyone, and it is the reason `01-deploy-infra.sh` can report `Apply complete!` while the workshop is already broken. Three separate upstream bugs stack up in one Job (full teardown in [`DIAGNOSTICS9.md`](./DIAGNOSTICS9.md)): a Pod Identity admission race leaves the pod with no credentials, the Job's own retry cannot fire because the validator is a sibling container rather than an initContainer, and Karpenter consolidates the node out from under a ~16GB download that has no volume to survive it. Throughout, `kubectl get job` reads `Running 0/1` — which is also what a healthy run looks like. `00-clone-terraform.sh` now patches all three at clone time. If you are debugging a run that predates that, check for an `eks-pod-identity-token` volume on the pod:
+3. **The model-download Job can fail silently for an hour.** Not account-level — this one hits everyone, and it is the reason `01-deploy-infra.sh` can report `Apply complete!` while the workshop is already broken. Three separate upstream bugs stack up in one Job (full teardown in [`DIAGNOSTICS9.md`](./DIAGNOSTICS9.md)): a Pod Identity admission race leaves the pod with no credentials, the Job's own retry cannot fire because the validator is a sibling container rather than an initContainer, and Karpenter consolidates the node out from under a 9.7GB download that has no volume to survive it. Throughout, `kubectl get job` reads `Running 0/1` — which is also what a healthy run looks like. `00-clone-terraform.sh` now patches all three at clone time. If you are debugging a run that predates that, check for an `eks-pod-identity-token` volume on the pod:
    ```bash
    kubectl get pod -n default -l job-name=model-download -o jsonpath='{.items[0].spec.volumes[*].name}'
    ```
